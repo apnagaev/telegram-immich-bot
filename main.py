@@ -83,12 +83,25 @@ os.makedirs(TEMP_DIR, exist_ok=True)
 USER_TAGS_MEM = {}
 ALBUM_CACHE = {}
 
+# Финальный минимальный список разрешений (ровно 10)
+REQUIRED_PERMISSIONS = {
+    "user.read": "Чтение профиля пользователя (email, имя)",
+    "asset": "Базовый доступ к ассетам",
+    "asset.read": "Чтение метаданных ассетов (проверка дубликатов)",
+    "asset.download": "Скачивание оригиналов файлов",
+    "asset.upload": "Загрузка новых фото/видео",
+    "asset.update": "Обновление описания ассетов",
+    "album": "Базовый доступ к альбомам",
+    "album.read": "Поиск существующих альбомов",
+    "album.create": "Создание альбомов (Telegram Upload)",
+    "albumAsset.create": "Добавление ассетов в альбомы"
+}
+
 if not TOKEN:
     logging.error("Variabile d'ambiente TELEGRAM_TOKEN mancante!"); exit(1)
 
 # --- USER MAPPING FUNCTIONS ---
 def load_user_mapping() -> dict:
-    """Загружает или создает файл маппинга пользователей."""
     if not os.path.exists(USER_MAPPING_FILE):
         try:
             with open(USER_MAPPING_FILE, 'w', encoding='utf-8') as f:
@@ -97,7 +110,6 @@ def load_user_mapping() -> dict:
         except Exception as e:
             logging.error(f"❌ Не удалось создать {USER_MAPPING_FILE}: {e}")
             return {}
-    
     try:
         with open(USER_MAPPING_FILE, 'r', encoding='utf-8') as f:
             return json.load(f)
@@ -106,7 +118,6 @@ def load_user_mapping() -> dict:
         return {}
 
 def save_user_mapping(mapping: dict):
-    """Сохраняет файл маппинга пользователей."""
     try:
         with open(USER_MAPPING_FILE, 'w', encoding='utf-8') as f:
             json.dump(mapping, f, indent=2)
@@ -114,7 +125,6 @@ def save_user_mapping(mapping: dict):
         logging.error(f"❌ Ошибка сохранения {USER_MAPPING_FILE}: {e}")
 
 def get_user_config(telegram_user_id: int) -> dict:
-    """Ищет конфигурацию пользователя по Telegram ID. Возвращает None, если не найден."""
     mapping = load_user_mapping()
     for email, data in mapping.items():
         if str(data.get("telegram_user_id")) == str(telegram_user_id):
@@ -124,6 +134,398 @@ def get_user_config(telegram_user_id: int) -> dict:
                 "max_user_id": data.get("max_user_id")
             }
     return None
+
+# --- PERMISSION CHECK FUNCTIONS ---
+def _get_error_detail(resp):
+    try:
+        data = resp.json()
+        if isinstance(data, dict):
+            msg = data.get("message") or data.get("error") or data.get("detail")
+            if msg:
+                return str(msg)[:200]
+            if "errors" in data and isinstance(data["errors"], list):
+                return "; ".join(str(e) for e in data["errors"][:3])[:200]
+    except Exception:
+        pass
+    try:
+        return resp.text[:200]
+    except Exception:
+        return ""
+
+def _extract_asset_id_from_response(data):
+    if isinstance(data, dict):
+        if "assets" in data:
+            assets_data = data["assets"]
+            if isinstance(assets_data, dict) and "items" in assets_data:
+                items = assets_data["items"]
+                if items and isinstance(items, list) and len(items) > 0:
+                    item = items[0]
+                    if isinstance(item, dict) and "id" in item:
+                        return item["id"]
+            elif isinstance(assets_data, list) and len(assets_data) > 0:
+                item = assets_data[0]
+                if isinstance(item, dict) and "id" in item:
+                    return item["id"]
+        if "items" in data and isinstance(data["items"], list) and len(data["items"]) > 0:
+            item = data["items"][0]
+            if isinstance(item, dict) and "id" in item:
+                return item["id"]
+        if "result" in data and isinstance(data["result"], dict):
+            items = data["result"].get("items", [])
+            if items and len(items) > 0:
+                item = items[0]
+                if isinstance(item, dict) and "id" in item:
+                    return item["id"]
+        if "assets" in data and isinstance(data["assets"], list) and len(data["assets"]) > 0:
+            item = data["assets"][0]
+            if isinstance(item, dict) and "id" in item:
+                return item["id"]
+    return None
+
+def _get_existing_asset_id(headers):
+    attempts = [
+        ("POST", f"{IMMICH_URL}/api/search/metadata", {"page": 1, "size": 1}),
+        ("POST", f"{IMMICH_URL}/api/search/random", {"count": 1}),
+    ]
+    for method, endpoint, payload in attempts:
+        try:
+            if method == "POST":
+                resp = requests.post(endpoint, headers=headers, json=payload, timeout=10)
+            else:
+                resp = requests.get(endpoint, headers=headers, params=payload, timeout=10)
+            
+            if resp.status_code != 200:
+                continue
+            
+            data = resp.json()
+            asset_id = _extract_asset_id_from_response(data)
+            if asset_id:
+                return asset_id
+        except Exception:
+            continue
+    return None
+
+def _get_existing_album_id(headers):
+    try:
+        resp = requests.get(f"{IMMICH_URL}/api/albums", headers=headers, timeout=10)
+        if resp.status_code == 200:
+            albums = resp.json()
+            if isinstance(albums, list) and len(albums) > 0:
+                for album in albums:
+                    if isinstance(album, dict) and album.get("id"):
+                        album_name = album.get("albumName", "")
+                        if not album_name.startswith("_perm_") and not album_name.startswith("_test_"):
+                            return album["id"], album_name
+                return albums[0]["id"], albums[0].get("albumName", "")
+    except Exception:
+        pass
+    return None, None
+
+async def check_api_key_permissions(api_key: str) -> dict:
+    results = {}
+    for perm in REQUIRED_PERMISSIONS:
+        results[perm] = {"status": False, "message": "Не проверено"}
+    
+    headers = {"x-api-key": api_key, "Accept": "application/json"}
+    
+    # 1. Проверка user.read, asset, asset.read через GET /api/users/me
+    try:
+        resp = requests.get(f"{IMMICH_URL}/api/users/me", headers=headers, timeout=10)
+        if resp.status_code == 200:
+            results["user.read"]["status"] = True
+            results["user.read"]["message"] = "✅ OK"
+            results["asset"]["status"] = True
+            results["asset"]["message"] = "✅ OK"
+            results["asset.read"]["status"] = True
+            results["asset.read"]["message"] = "✅ OK"
+        elif resp.status_code == 403:
+            results["user.read"]["status"] = False
+            results["user.read"]["message"] = "❌ Нет доступа (403)"
+            results["asset"]["status"] = False
+            results["asset"]["message"] = "❌ Нет доступа (403)"
+            results["asset.read"]["status"] = False
+            results["asset.read"]["message"] = "❌ Нет доступа (403)"
+        else:
+            detail = _get_error_detail(resp)
+            results["user.read"]["status"] = False
+            results["user.read"]["message"] = f"⚠️ Ошибка {resp.status_code}: {detail}"
+    except Exception as e:
+        results["user.read"]["status"] = False
+        results["user.read"]["message"] = f"❌ Ошибка: {str(e)[:80]}"
+    
+    # 2. Проверка album, album.read
+    try:
+        resp = requests.get(f"{IMMICH_URL}/api/albums", headers=headers, timeout=10)
+        if resp.status_code == 200:
+            results["album"]["status"] = True
+            results["album"]["message"] = "✅ OK"
+            results["album.read"]["status"] = True
+            results["album.read"]["message"] = "✅ OK"
+        elif resp.status_code == 403:
+            results["album.read"]["status"] = False
+            results["album.read"]["message"] = "❌ Нет доступа (403)"
+        else:
+            detail = _get_error_detail(resp)
+            results["album.read"]["status"] = False
+            results["album.read"]["message"] = f"⚠️ Ошибка {resp.status_code}: {detail}"
+    except Exception as e:
+        results["album.read"]["status"] = False
+        results["album.read"]["message"] = f"❌ Ошибка: {str(e)[:80]}"
+    
+    # 3. Проверка album.create
+    test_album_id = None
+    try:
+        test_album_name = f"_perm_test_{uuid.uuid4().hex[:12]}"
+        resp = requests.post(
+            f"{IMMICH_URL}/api/albums",
+            headers=headers,
+            json={"albumName": test_album_name},
+            timeout=10
+        )
+        if resp.status_code in [200, 201]:
+            test_album_id = resp.json().get("id")
+            results["album.create"]["status"] = True
+            try:
+                del_resp = requests.delete(f"{IMMICH_URL}/api/albums/{test_album_id}", headers=headers, timeout=10)
+                if del_resp.status_code in [200, 204]:
+                    results["album.create"]["message"] = "✅ OK"
+                    test_album_id = None
+                else:
+                    results["album.create"]["message"] = f"✅ OK (альбом '{test_album_name}' не удалён, удалите вручную)"
+            except:
+                results["album.create"]["message"] = f"✅ OK (альбом '{test_album_name}' не удалён, удалите вручную)"
+        elif resp.status_code == 403:
+            results["album.create"]["status"] = False
+            results["album.create"]["message"] = "❌ Нет доступа (403)"
+        else:
+            detail = _get_error_detail(resp)
+            results["album.create"]["status"] = False
+            results["album.create"]["message"] = f"⚠️ Ошибка {resp.status_code}: {detail}"
+    except Exception as e:
+        results["album.create"]["status"] = False
+        results["album.create"]["message"] = f"❌ Ошибка: {str(e)[:80]}"
+    finally:
+        if test_album_id:
+            try:
+                requests.delete(f"{IMMICH_URL}/api/albums/{test_album_id}", headers=headers, timeout=10)
+            except:
+                pass
+    
+    # 4. Получаем существующий ассет и альбом
+    existing_asset_id = _get_existing_asset_id(headers)
+    existing_album_id, existing_album_name = _get_existing_album_id(headers)
+    created_test_asset = False
+    
+    # Fallback: если ассетов нет, создаём тестовый
+    if not existing_asset_id:
+        test_file_path = os.path.join(TEMP_DIR, f"perm_test_{uuid.uuid4().hex[:12]}.jpg")
+        try:
+            img = Image.new('RGB', (1920, 1080), color=(120, 80, 200))
+            img.save(test_file_path, format='JPEG', quality=90)
+            now_iso = datetime.now().isoformat()
+            with open(test_file_path, 'rb') as f:
+                files = {"assetData": ("perm_test.jpg", f, "image/jpeg")}
+                data = {
+                    "deviceAssetId": f"perm-check-{uuid.uuid4().hex}",
+                    "deviceId": "tg-immich-bot-perm-check",
+                    "fileCreatedAt": now_iso,
+                    "fileModifiedAt": now_iso,
+                    "isFavorite": "false",
+                }
+                resp = requests.post(f"{IMMICH_URL}/api/assets", headers=headers, files=files, data=data, timeout=30)
+                if resp.status_code in [200, 201]:
+                    existing_asset_id = resp.json().get("id")
+                    created_test_asset = True
+        except Exception:
+            pass
+        finally:
+            if os.path.exists(test_file_path):
+                try: os.remove(test_file_path)
+                except: pass
+
+    # 5. Проверка asset.download
+    if existing_asset_id:
+        try:
+            dl_resp = requests.get(f"{IMMICH_URL}/api/assets/{existing_asset_id}/original", headers=headers, timeout=30)
+            if dl_resp.status_code == 200:
+                results["asset.download"]["status"] = True
+                results["asset.download"]["message"] = "✅ OK"
+            elif dl_resp.status_code == 403:
+                results["asset.download"]["status"] = False
+                results["asset.download"]["message"] = "❌ Нет доступа (403)"
+            else:
+                results["asset.download"]["status"] = False
+                results["asset.download"]["message"] = f"⚠️ Ошибка {dl_resp.status_code}"
+        except Exception as e:
+            results["asset.download"]["status"] = False
+            results["asset.download"]["message"] = f"❌ Ошибка: {str(e)[:80]}"
+    else:
+        results["asset.download"]["status"] = False
+        results["asset.download"]["message"] = "ℹ️ Невозможно проверить (нет ассетов)"
+
+    # 6. Проверка asset.update
+    if existing_asset_id:
+        original_description = ""
+        try:
+            get_resp = requests.get(f"{IMMICH_URL}/api/assets/{existing_asset_id}", headers=headers, timeout=10)
+            if get_resp.status_code == 200:
+                original_description = get_resp.json().get("description") or ""
+            
+            update_resp = requests.put(
+                f"{IMMICH_URL}/api/assets/{existing_asset_id}",
+                headers=headers,
+                json={"description": f"perm_test_{uuid.uuid4().hex[:8]}"},
+                timeout=10
+            )
+            if update_resp.status_code == 200:
+                results["asset.update"]["status"] = True
+                results["asset.update"]["message"] = "✅ OK"
+            elif update_resp.status_code == 403:
+                results["asset.update"]["status"] = False
+                results["asset.update"]["message"] = "❌ Нет доступа (403)"
+            else:
+                results["asset.update"]["status"] = False
+                results["asset.update"]["message"] = f"⚠️ Ошибка {update_resp.status_code}"
+        except Exception as e:
+            results["asset.update"]["status"] = False
+            results["asset.update"]["message"] = f"❌ Ошибка: {str(e)[:80]}"
+        finally:
+            try:
+                requests.put(f"{IMMICH_URL}/api/assets/{existing_asset_id}", headers=headers, json={"description": original_description}, timeout=10)
+            except:
+                pass
+    else:
+        results["asset.update"]["status"] = False
+        results["asset.update"]["message"] = "ℹ️ Невозможно проверить (нет ассетов)"
+
+    # 7. Проверка albumAsset.create
+    if existing_asset_id and existing_album_id:
+        try:
+            resp = requests.put(
+                f"{IMMICH_URL}/api/albums/{existing_album_id}/assets",
+                headers=headers,
+                json={"ids": [existing_asset_id]},
+                timeout=10
+            )
+            if resp.status_code == 200:
+                results["albumAsset.create"]["status"] = True
+                results["albumAsset.create"]["message"] = f"✅ OK (добавлен в '{existing_album_name}')"
+            elif resp.status_code == 403:
+                results["albumAsset.create"]["status"] = False
+                results["albumAsset.create"]["message"] = "❌ Нет доступа (403)"
+            else:
+                results["albumAsset.create"]["status"] = False
+                results["albumAsset.create"]["message"] = f"⚠️ Ошибка {resp.status_code}"
+        except Exception as e:
+            results["albumAsset.create"]["status"] = False
+            results["albumAsset.create"]["message"] = f"❌ Ошибка: {str(e)[:80]}"
+    else:
+        results["albumAsset.create"]["status"] = False
+        results["albumAsset.create"]["message"] = "ℹ️ Невозможно проверить (нет ассетов или альбомов)"
+
+    # 8. Проверка asset.upload (через повторную загрузку существующего)
+    if existing_asset_id and not created_test_asset:
+        try:
+            get_resp = requests.get(f"{IMMICH_URL}/api/assets/{existing_asset_id}", headers=headers, timeout=10)
+            if get_resp.status_code == 200:
+                asset_info = get_resp.json()
+                device_asset_id = asset_info.get("deviceAssetId", f"perm-check-{uuid.uuid4().hex}")
+                original_filename = asset_info.get("originalFileName", "test.jpg")
+                file_created_at = asset_info.get("fileCreatedAt", datetime.now().isoformat())
+                file_modified_at = asset_info.get("fileModifiedAt", datetime.now().isoformat())
+                
+                dl_resp = requests.get(f"{IMMICH_URL}/api/assets/{existing_asset_id}/original", headers=headers, timeout=30)
+                if dl_resp.status_code == 200:
+                    asset_bytes = dl_resp.content
+                    files = {"assetData": (original_filename, BytesIO(asset_bytes))}
+                    data = {
+                        "deviceAssetId": device_asset_id,
+                        "deviceId": "tg-immich-bot-perm-check",
+                        "fileCreatedAt": file_created_at,
+                        "fileModifiedAt": file_modified_at,
+                        "isFavorite": "false",
+                    }
+                    resp = requests.post(f"{IMMICH_URL}/api/assets", headers=headers, files=files, data=data, timeout=30)
+                    
+                    if resp.status_code in [200, 201]:
+                        res_json = resp.json()
+                        status = res_json.get("status", "")
+                        if status == "duplicate":
+                            results["asset.upload"]["status"] = True
+                            results["asset.upload"]["message"] = "✅ OK (duplicate)"
+                        elif status == "created":
+                            results["asset.upload"]["status"] = True
+                            results["asset.upload"]["message"] = "✅ OK (created)"
+                            new_asset_id = res_json.get("id")
+                            if new_asset_id:
+                                try: requests.delete(f"{IMMICH_URL}/api/assets", headers=headers, json={"ids": [new_asset_id]}, timeout=10)
+                                except: pass
+                        else:
+                            results["asset.upload"]["status"] = True
+                            results["asset.upload"]["message"] = "✅ OK"
+                    elif resp.status_code == 409:
+                        results["asset.upload"]["status"] = True
+                        results["asset.upload"]["message"] = "✅ OK (duplicate 409)"
+                    elif resp.status_code == 403:
+                        results["asset.upload"]["status"] = False
+                        results["asset.upload"]["message"] = "❌ Нет доступа (403)"
+                    else:
+                        results["asset.upload"]["status"] = False
+                        results["asset.upload"]["message"] = f"⚠️ Ошибка {resp.status_code}: {_get_error_detail(resp)}"
+        except Exception as e:
+            results["asset.upload"]["status"] = False
+            results["asset.upload"]["message"] = f"❌ Ошибка: {str(e)[:80]}"
+    elif created_test_asset:
+        results["asset.upload"]["status"] = True
+        results["asset.upload"]["message"] = "✅ OK (через тестовый ассет)"
+    else:
+        results["asset.upload"]["status"] = False
+        results["asset.upload"]["message"] = "ℹ️ Невозможно проверить (нет ассетов)"
+
+    # Очистка тестового ассета
+    if created_test_asset and existing_asset_id:
+        try:
+            requests.delete(f"{IMMICH_URL}/api/assets", headers=headers, json={"ids": [existing_asset_id]}, timeout=10)
+        except:
+            pass
+    
+    return results
+
+def format_permissions_report(results: dict) -> str:
+    lines = []
+    has_failure = False
+    has_info = False
+    
+    for perm, description in REQUIRED_PERMISSIONS.items():
+        status = results.get(perm, {}).get("status", False)
+        message = results.get(perm, {}).get("message", "Не проверено")
+        
+        is_info = "ℹ️" in message or "Невозможно проверить" in message
+        
+        if is_info:
+            icon = "ℹ️"
+            has_info = True
+        elif status:
+            icon = "✅"
+        else:
+            icon = "❌"
+            has_failure = True
+        
+        lines.append(f"{icon} <code>{perm}</code> — {description}")
+        if not status and not is_info and "Не проверено" not in message:
+            lines.append(f"   └─ {message}")
+    
+    if not has_failure:
+        if has_info:
+            lines.insert(0, "✅ <b>Основные права присутствуют!</b>\n")
+            lines.append("\nℹ️ <i>Некоторые права не удалось проверить автоматически (возможно, из-за отсутствия ассетов/альбомов). Это нормально для нового аккаунта.</i>")
+        else:
+            lines.insert(0, "✅ <b>Все необходимые права присутствуют!</b>\n")
+    else:
+        lines.insert(0, "⚠️ <b>Некоторые права отсутствуют:</b>\n")
+        lines.append("\n💡 Создайте новый API-ключ и вручную отметьте ровно 10 разрешений из списка выше.")
+    
+    return "\n".join(lines)
 
 # --- LOCK MECHANISM ---
 LOCK_FILE_PATH = os.getenv("LOCK_FILE_PATH", "/shared_storage/bot.lock")
@@ -190,14 +592,14 @@ def fix_perms(path):
     except: pass
 
 def load_history():
-    if not os.path.exists(HISTORY_FILE): 
+    if not os.path.exists(HISTORY_FILE):
         return {"albums": [], "photographers": [], "last_chat_id": None}
     try:
-        with open(HISTORY_FILE, 'r', encoding='utf-8') as f: 
+        with open(HISTORY_FILE, 'r', encoding='utf-8') as f:
             data = json.load(f)
             if "last_chat_id" not in data: data["last_chat_id"] = None
             return data
-    except: 
+    except:
         return {"albums": [], "photographers": [], "last_chat_id": None}
 
 def save_history(data):
@@ -224,7 +626,6 @@ def update_history(album, photographer, chat_id=None):
     if changed: save_history(data)
 
 def get_or_create_album(requested_name, api_key):
-    """Ищет альбом по имени. Если не находит или имя пустое, создает 'Telegram Upload'."""
     if not requested_name or len(str(requested_name).strip()) < 2:
         requested_name = "Telegram Upload"
     
@@ -252,7 +653,6 @@ def get_or_create_album(requested_name, api_key):
             nid = cr.json()["id"]
             ALBUM_CACHE[fallback_cache_key] = nid
             return nid
-            
     except Exception as e:
         logging.error(f"Ошибка работы с альбомами: {e}")
     return None
@@ -267,23 +667,12 @@ def parse_tags(text):
     return album, fotografo
 
 def clean_caption(text):
-    """
-    Очищает caption от служебных тегов #album и #fotografo,
-    чтобы в описании Immich остался только пользовательский текст.
-    """
-    if not text:
-        return None
-    
+    if not text: return None
     cleaned = text
-    # Удаляем #album <значение> (до следующего # или конца строки)
     cleaned = re.sub(r"#album\s+[^#\n\/]+", "", cleaned, flags=re.IGNORECASE)
-    # Удаляем #fotografo <значение>
     cleaned = re.sub(r"#fotografo\s+[^#\n\/]+", "", cleaned, flags=re.IGNORECASE)
-    # Удаляем лишние пробелы и переносы строк
     cleaned = re.sub(r"\n{3,}", "\n\n", cleaned)
-    cleaned = cleaned.strip()
-    
-    return cleaned if cleaned else None
+    return cleaned.strip() if cleaned.strip() else None
 
 def get_effective_tags(user_id, current_text):
     ta, tf = parse_tags(current_text)
@@ -353,9 +742,6 @@ async def find_asset_by_checksum(checksum, api_key):
 # --- UPLOAD ---
 async def upload_file_path_to_immich(file_path, original_name, telegram_date, message_id, user_api_key, override_date=None, extra_album=None, fotografo=None, caption=None):
     try:
-        if fotografo: logging.info(f"Uploading {original_name} with Photographer: {fotografo}")
-        if caption: logging.info(f"Uploading {original_name} with Caption: {caption[:50]}...")
-        
         real_date = override_date or telegram_date
         headers = {"x-api-key": user_api_key, "Accept": "application/json"}
         
@@ -390,34 +776,24 @@ async def upload_file_path_to_immich(file_path, original_name, telegram_date, me
         
         if not asset_id: return status, None
 
-        # --- Формируем итоговое описание ---
-        # Объединяем caption (очищенный от тегов) и информацию о фотографе
         description_parts = []
-        
         if caption:
             cleaned_caption = clean_caption(caption)
             if cleaned_caption:
                 description_parts.append(cleaned_caption)
-        
         if fotografo:
             description_parts.append(f"Fotografo: {fotografo}")
         
         if description_parts:
             final_description = "\n\n".join(description_parts)
             try:
-                requests.put(
-                    f"{IMMICH_URL}/api/assets/{asset_id}", 
-                    headers=headers, 
-                    json={"description": final_description}, 
-                    timeout=10
-                )
+                requests.put(f"{IMMICH_URL}/api/assets/{asset_id}", headers=headers, json={"description": final_description}, timeout=10)
             except Exception as e: 
                 logging.error(f"Desc upd error: {e}")
 
         target_ids = []
         aid = get_or_create_album(extra_album, user_api_key)
         if aid: target_ids.append(aid)
-        
         if fotografo:
             fid = get_or_create_album(fotografo, user_api_key)
             if fid: target_ids.append(fid)
@@ -484,10 +860,8 @@ async def process_directory_content(directory, msg_date, msg_id, user_config: di
             p_alb, p_foto = parse_tags(rel_p)
             
             if p_foto: logging.info(f"Found photographer in path: {p_foto}")
-
             if p_alb and not final_alb: final_alb = p_alb
             if p_foto and not final_foto: final_foto = p_foto
-            
             if final_alb: current_job_albums.add(final_alb)
             
             fb_date = msg_date
@@ -558,7 +932,6 @@ async def watch_folder_task(app):
                 
             if not has_valid_content: continue
             
-            # Находим первого настроенного пользователя для Watch Folder
             mapping = load_user_mapping()
             if not mapping:
                 logging.warning("⚠️ Watch folder: файлы обнаружены, но нет настроенных пользователей. Пропуск.")
@@ -597,66 +970,122 @@ async def watch_folder_task(app):
 
 # --- HANDLERS ---
 async def handle_setup(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Обрабатывает команду /setup <api_key>"""
     user_id = update.effective_user.id
     args = context.args
     
     if not args:
+        permissions_list = "\n".join([f"• <code>{perm}</code> — {desc}" for perm, desc in REQUIRED_PERMISSIONS.items()])
         await update.message.reply_text(
-            "⚙️ <b>Настройка аккаунта Immich</b>\n\n"
-            "Используйте команду:\n"
-            "<code>/setup ВАШ_API_КЛЮЧ</code>\n\n"
-            "Где взять ключ:\n"
-            "1. Откройте Immich\n"
-            "2. Перейдите в Настройки -> Безопасность -> Ключи API\n"
-            "3. Создайте новый ключ и скопируйте его сюда.",
+            f"⚙️ <b>Настройка аккаунта Immich</b>\n\n"
+            f"Используйте команду:\n<code>/setup ВАШ_API_КЛЮЧ</code>\n\n"
+            f"<b>Необходимые права API-ключа (ровно 10):</b>\n{permissions_list}\n\n"
+            f"<b>Как создать ключ:</b>\n"
+            f"1. Откройте Immich → Профиль → Account Settings\n"
+            f"2. Перейдите в раздел <b>API Keys</b>\n"
+            f"3. Нажмите <b>New API Key</b>\n"
+            f"4. Вручную отметьте все 10 разрешений из списка выше\n"
+            f"5. Нажмите <b>Generate</b> и скопируйте ключ\n"
+            f"6. Отправьте: <code>/setup &lt;ключ&gt;</code>\n\n"
+            f"💡 <b>Важно:</b> Не используйте разрешение <b>All</b> — это избыточно и небезопасно. Отметьте только перечисленные разрешения.",
             parse_mode="HTML"
         )
         return
     
     api_key = args[0]
-    headers = {"x-api-key": api_key, "Accept": "application/json"}
-    
-    await update.message.reply_text("⏳ Проверяю ключ и получаю данные аккаунта...")
+    status_msg = await update.message.reply_text("⏳ Проверяю ключ и необходимые права...")
     
     try:
+        headers = {"x-api-key": api_key, "Accept": "application/json"}
         resp = requests.get(f"{IMMICH_URL}/api/users/me", headers=headers, timeout=10)
-        if resp.status_code == 200:
-            user_info = resp.json()
-            email = user_info.get("email")
-            
-            if not email:
-                await update.message.reply_text("❌ Не удалось получить email из Immich. Проверьте ключ.")
-                return
-            
-            mapping = load_user_mapping()
-            mapping[email] = {
-                "immich_api_key": api_key,
-                "telegram_user_id": user_id,
-                "max_user_id": None
-            }
-            save_user_mapping(mapping)
-            
-            await update.message.reply_text(
-                f"✅ <b>Аккаунт успешно настроен!</b>\n\n"
-                f"📧 Email: <code>{email}</code>\n"
-                f"🆔 Telegram ID: <code>{user_id}</code>\n\n"
-                f"Теперь вы можете отправлять фото и видео, и они будут загружаться в ваш личный профиль Immich.",
-                parse_mode="HTML"
-            )
+        
+        if resp.status_code != 200:
+            await status_msg.edit_text(f"❌ Неверный API ключ или ошибка подключения к Immich.\nКод ответа: {resp.status_code}")
+            return
+        
+        user_info = resp.json()
+        email = user_info.get("email")
+        if not email:
+            await status_msg.edit_text("❌ Не удалось получить email из Immich. Проверьте ключ.")
+            return
+        
+        await status_msg.edit_text("⏳ Проверяю наличие всех необходимых прав API-ключа...\n\nЭто может занять несколько секунд.")
+        permissions_results = await check_api_key_permissions(api_key)
+        
+        has_failure = any(
+            not results.get("status", False) and 
+            "ℹ️" not in results.get("message", "") and 
+            "Невозможно проверить" not in results.get("message", "") 
+            for results in permissions_results.values()
+        )
+        
+        mapping = load_user_mapping()
+        mapping[email] = {"immich_api_key": api_key, "telegram_user_id": user_id, "max_user_id": None}
+        save_user_mapping(mapping)
+        
+        permissions_report = format_permissions_report(permissions_results)
+        
+        if not has_failure:
+            final_message = f"✅ <b>Аккаунт успешно настроен!</b>\n\n📧 Email: <code>{email}</code>\n🆔 Telegram ID: <code>{user_id}</code>\n\n{permissions_report}\n\nТеперь вы можете отправлять фото и видео."
         else:
-            await update.message.reply_text(f"❌ Неверный API ключ или ошибка подключения к Immich. (Код ответа: {resp.status_code})\nПроверьте ключ и переменную IMMICH_URL.")
+            final_message = f"⚠️ <b>Аккаунт настроен, но есть проблемы с правами!</b>\n\n📧 Email: <code>{email}</code>\n🆔 Telegram ID: <code>{user_id}</code>\n\n{permissions_report}\n\n💡 Проверьте, что отмечены все 10 разрешений, и повторите /setup."
+        
+        await status_msg.edit_text(final_message, parse_mode="HTML")
     except requests.exceptions.ConnectionError:
-        await update.message.reply_text("❌ Не удалось подключиться к Immich. Проверьте переменную IMMICH_URL в настройках бота.")
+        await status_msg.edit_text("❌ Не удалось подключиться к Immich. Проверьте переменную IMMICH_URL.")
     except Exception as e:
-        await update.message.reply_text(f"❌ Ошибка при проверке ключа: {e}")
+        logging.error(f"Ошибка в handle_setup: {e}", exc_info=True)
+        await status_msg.edit_text(f"❌ Ошибка при проверке ключа: {e}")
 
-async def send_tags_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
+async def handle_status(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
     user_config = get_user_config(user_id)
     
     if not user_config:
-        await update.message.reply_text("⚠️ Ваш аккаунт не настроен. Используйте команду /setup <api_key> для начала работы.")
+        await update.message.reply_text("⚠️ <b>Аккаунт не настроен!</b>\n\nИспользуйте команду:\n<code>/setup ВАШ_API_КЛЮЧ</code>", parse_mode="HTML")
+        return
+    
+    status_msg = await update.message.reply_text("⏳ Получаю информацию и проверяю права...")
+    
+    try:
+        permissions_results = await check_api_key_permissions(user_config["api_key"])
+        permissions_report = format_permissions_report(permissions_results)
+        
+        has_failure = any(
+            not results.get("status", False) and 
+            "ℹ️" not in results.get("message", "") and 
+            "Невозможно проверить" not in results.get("message", "") 
+            for results in permissions_results.values()
+        )
+        
+        headers = {"x-api-key": user_config["api_key"], "Accept": "application/json"}
+        resp = requests.get(f"{IMMICH_URL}/api/users/me", headers=headers, timeout=10)
+        user_info = resp.json() if resp.status_code == 200 else {}
+        
+        status_text = f"📊 <b>Статус аккаунта</b>\n\n"
+        status_text += f"📧 <b>Email:</b> <code>{user_config['email']}</code>\n"
+        status_text += f"🆔 <b>Telegram ID:</b> <code>{user_id}</code>\n"
+        if user_info.get('name'):
+            status_text += f"👤 <b>Имя:</b> {user_info.get('name')}\n"
+        
+        api_key = user_config["api_key"]
+        masked_key = api_key[:6] + "••••••••" + api_key[-4:] if len(api_key) > 12 else "••••••"
+        status_text += f"🔑 <b>API Key:</b> <code>{masked_key}</code>\n"
+        status_text += f"\n<b>Проверка прав API-ключа:</b>\n{permissions_report}\n\n"
+        
+        if not has_failure:
+            status_text += "✅ <b>Все права присутствуют. Бот готов к работе!</b>"
+        else:
+            status_text += "⚠️ <b>Некоторые права отсутствуют. Создайте новый API-ключ и отметьте только необходимые разрешения.</b>"
+        
+        await status_msg.edit_text(status_text, parse_mode="HTML")
+    except Exception as e:
+        logging.error(f"Ошибка в handle_status: {e}", exc_info=True)
+        await status_msg.edit_text(f"❌ Ошибка при получении статуса: {e}")
+
+async def send_tags_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user_id = update.effective_user.id
+    if not get_user_config(user_id):
+        await update.message.reply_text("⚠️ Ваш аккаунт не настроен. Используйте команду /setup <api_key>.")
         return
 
     update_history(None, None, update.effective_chat.id)
@@ -692,9 +1121,7 @@ async def get_tags_markup(user_id):
 async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query; await query.answer()
     user_id = update.effective_user.id
-    
-    user_config = get_user_config(user_id)
-    if not user_config:
+    if not get_user_config(user_id):
         await query.answer("Аккаунт не настроен!", show_alert=True)
         return
 
@@ -718,10 +1145,8 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
-    user_config = get_user_config(user_id)
-    
-    if not user_config:
-        await update.message.reply_text("⚠️ Ваш аккаунт не настроен. Используйте команду /setup <api_key> для начала работы.")
+    if not get_user_config(user_id):
+        await update.message.reply_text("⚠️ Ваш аккаунт не настроен. Используйте команду /setup <api_key>.")
         return
 
     text = update.message.text
@@ -738,46 +1163,30 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def handle_any_media(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
     user_config = get_user_config(user_id)
-    
     if not user_config:
-        await update.message.reply_text(
-            "⚠️ <b>Аккаунт не настроен!</b>\n\n"
-            "Прежде чем отправлять файлы, настройте свой аккаунт Immich:\n"
-            "<code>/setup ВАШ_API_КЛЮЧ</code>",
-            parse_mode="HTML"
-        )
+        await update.message.reply_text("⚠️ <b>Аккаунт не настроен!</b>\n\nПрежде чем отправлять файлы, настройте свой аккаунт Immich:\n<code>/setup ВАШ_API_КЛЮЧ</code>", parse_mode="HTML")
         return
 
     update_history(None, None, update.effective_chat.id)
     msg = update.message
     tags = get_effective_tags(user_id, msg.caption or "")
-    # Получаем caption для сохранения в описании Immich
     raw_caption = msg.caption or None
-    
     file_obj = None; fname = "file.jpg"
     
     if msg.document:
         fname = msg.document.file_name or "file"
         mime = msg.document.mime_type or ""
         file_size = msg.document.file_size or 0
-        
         if "image" in mime or "video" in mime or fname.lower().endswith((".zip", ".rar", ".7z", ".tar", ".gz")):
             if file_size > 20 * 1024 * 1024 and telethon_client:
                 job_dir = os.path.join(TEMP_DIR, f"zip_{msg.message_id}")
                 os.makedirs(job_dir, exist_ok=True)
                 dest_path = os.path.join(job_dir, fname)
-                
                 sm = await msg.reply_text("⏳ <b>Скачивание большого файла через Telethon...</b>", parse_mode="HTML")
-                
                 try:
                     telethon_msg = await telethon_client.get_messages(msg.chat_id, ids=msg.message_id)
                     await telethon_client.download_media(telethon_msg, file=dest_path)
-                    stats, albums = await process_directory_content(
-                        job_dir, msg.date, msg.message_id, 
-                        user_config=user_config, 
-                        manual_tags=tags, bot=context.bot, chat_id=msg.chat_id,
-                        caption=raw_caption
-                    )
+                    stats, albums = await process_directory_content(job_dir, msg.date, msg.message_id, user_config=user_config, manual_tags=tags, bot=context.bot, chat_id=msg.chat_id, caption=raw_caption)
                     shutil.rmtree(job_dir)
                     rep = f"📦 <b>Большой архив обработан!</b>\n✅ {stats['success']} Фото\n♻️ {stats['duplicate']} Дубликатов"
                     if albums: rep += f"\n📂 <b>Альбомы:</b> {', '.join(albums)}"
@@ -788,7 +1197,6 @@ async def handle_any_media(update: Update, context: ContextTypes.DEFAULT_TYPE):
                     await context.bot.edit_message_text(chat_id=msg.chat_id, message_id=sm.message_id, text=f"❌ Ошибка скачивания: {e}")
                     shutil.rmtree(job_dir, ignore_errors=True)
                     return
-            
             try:
                 file_obj = await msg.document.get_file()
             except TelegramError as e:
@@ -796,32 +1204,22 @@ async def handle_any_media(update: Update, context: ContextTypes.DEFAULT_TYPE):
                     await msg.reply_text(f"❌ Файл слишком большой ({file_size / (1024*1024):.1f} МБ). Настройте Telethon или используйте папку импорта.")
                     return
                 raise
-
     elif msg.photo:
         file_obj = await msg.photo[-1].get_file(); fname = f"photo_{file_obj.file_unique_id}.jpg"
     elif msg.video:
         file_obj = await msg.video.get_file(); fname = msg.video.file_name or f"video_{file_obj.file_unique_id}.mp4"
     elif msg.video_note:
         file_size = msg.video_note.file_size or 0
-        
         if file_size > 20 * 1024 * 1024 and telethon_client:
             job_dir = os.path.join(TEMP_DIR, f"vnote_{msg.message_id}")
             os.makedirs(job_dir, exist_ok=True)
             fname = f"video_note_{msg.video_note.file_unique_id}.mp4"
             dest_path = os.path.join(job_dir, fname)
-            
             sm = await msg.reply_text("⏳ <b>Скачивание большого видеосообщения через Telethon...</b>", parse_mode="HTML")
-            
             try:
                 telethon_msg = await telethon_client.get_messages(msg.chat_id, ids=msg.message_id)
                 await telethon_client.download_media(telethon_msg, file=dest_path)
-                status, _ = await upload_file_path_to_immich(
-                    dest_path, fname, msg.date, msg.message_id,
-                    user_api_key=user_config["api_key"],
-                    extra_album=tags[0] if tags and tags[0] else None,
-                    fotografo=tags[1] if tags and len(tags) > 1 else None,
-                    caption=raw_caption
-                )
+                status, _ = await upload_file_path_to_immich(dest_path, fname, msg.date, msg.message_id, user_api_key=user_config["api_key"], extra_album=tags[0] if tags and tags[0] else None, fotografo=tags[1] if tags and len(tags) > 1 else None, caption=raw_caption)
                 shutil.rmtree(job_dir)
                 report = "✅ Видео загружено!" if status == "success" else "♻️ Дубликат (теги обновлены)."
                 await context.bot.edit_message_text(chat_id=msg.chat_id, message_id=sm.message_id, text=report, parse_mode="HTML")
@@ -831,7 +1229,6 @@ async def handle_any_media(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 await context.bot.edit_message_text(chat_id=msg.chat_id, message_id=sm.message_id, text=f"❌ Ошибка скачивания: {e}")
                 shutil.rmtree(job_dir, ignore_errors=True)
                 return
-        
         max_retries = 3
         for attempt in range(max_retries):
             try:
@@ -853,25 +1250,14 @@ async def handle_any_media(update: Update, context: ContextTypes.DEFAULT_TYPE):
             job_dir = os.path.join(TEMP_DIR, f"zip_{msg.message_id}"); os.makedirs(job_dir, exist_ok=True)
             sm = await msg.reply_text("⏳ <b>Archivio ricevuto...</b>", parse_mode="HTML")
             await file_obj.download_to_drive(os.path.join(job_dir, fname))
-            stats, albums = await process_directory_content(
-                job_dir, msg.date, msg.message_id, 
-                user_config=user_config, 
-                manual_tags=tags, bot=context.bot, chat_id=msg.chat_id,
-                caption=raw_caption
-            )
+            stats, albums = await process_directory_content(job_dir, msg.date, msg.message_id, user_config=user_config, manual_tags=tags, bot=context.bot, chat_id=msg.chat_id, caption=raw_caption)
             shutil.rmtree(job_dir)
             rep = f"📦 <b>Elaborato!</b>\n✅ {stats['success']} Foto\n♻️ {stats['duplicate']} Duplicati"
             if albums: rep += f"\n📂 <b>Album:</b> {', '.join(albums)}"
             await context.bot.edit_message_text(chat_id=msg.chat_id, message_id=sm.message_id, text=rep, parse_mode="HTML")
         else:
             tmp = os.path.join(TEMP_DIR, fname); await file_obj.download_to_drive(tmp)
-            status, _ = await upload_file_path_to_immich(
-                tmp, fname, msg.date, msg.message_id, 
-                user_api_key=user_config["api_key"], 
-                extra_album=tags[0] if tags and tags[0] else None, 
-                fotografo=tags[1] if tags and len(tags)>1 else None,
-                caption=raw_caption
-            )
+            status, _ = await upload_file_path_to_immich(tmp, fname, msg.date, msg.message_id, user_api_key=user_config["api_key"], extra_album=tags[0] if tags and tags[0] else None, fotografo=tags[1] if tags and len(tags)>1 else None, caption=raw_caption)
             os.remove(tmp)
             report = "✅ Caricata!" if status == "success" else "♻️ Duplicata (Tag Aggiornati)."
             if tags and tags[0]: report += f"\n📂 Album: {tags[0]}"
@@ -880,10 +1266,8 @@ async def handle_any_media(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def handle_url(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
-    user_config = get_user_config(user_id)
-    
-    if not user_config:
-        await update.message.reply_text("⚠️ Ваш аккаунт не настроен. Используйте команду /setup <api_key> для начала работы.")
+    if not get_user_config(user_id):
+        await update.message.reply_text("⚠️ Ваш аккаунт не настроен. Используйте команду /setup <api_key>.")
         return
 
     update_history(None, None, update.effective_chat.id)
@@ -900,7 +1284,6 @@ async def handle_url(update: Update, context: ContextTypes.DEFAULT_TYPE):
     job_dir = os.path.join(TEMP_DIR, f"job_{update.message.message_id}"); os.makedirs(job_dir, exist_ok=True)
     msg = await update.message.reply_text("⏳ <b>Link ricevuto...</b>", parse_mode="HTML")
     success = False
-    
     try:
         if "wetransfer.com" in url or "we.tl" in url:
             cmd = ["python3", "/opt/transferwee/transferwee.py", "download", url]
@@ -925,7 +1308,6 @@ async def handle_url(update: Update, context: ContextTypes.DEFAULT_TYPE):
         except:
             pass
     
-    downloaded_files = [f for f in os.listdir(job_dir) if os.path.isfile(os.path.join(job_dir, f))]
     for fname in downloaded_files:
         full_path = os.path.join(job_dir, fname)
         if "?" in fname or "=" in fname or not any(fname.lower().endswith(ext) for ext in ['.zip', '.rar', '.7z', '.jpg', '.jpeg', '.png', '.mp4', '.mov']):
@@ -943,18 +1325,12 @@ async def handle_url(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 except Exception as e:
                     logging.warning(f"Не удалось переименовать {fname}: {e}")
                     
-    stats, albums = await process_directory_content(
-        job_dir, update.message.date, update.message.message_id, 
-        user_config=user_config, 
-        manual_tags=tags, bot=context.bot, chat_id=update.message.chat_id
-    )
+    stats, albums = await process_directory_content(job_dir, update.message.date, update.message.message_id, user_config=user_config, manual_tags=tags, bot=context.bot, chat_id=update.message.chat_id)
     shutil.rmtree(job_dir)
     rep = f"✅ <b>Completato!</b>\n{stats['success']} Caricati\n{stats['duplicate']} Duplicati (Aggiornati)"
     if albums: rep += f"\n📂 Album: {', '.join(albums)}"
     await context.bot.edit_message_text(chat_id=msg.chat_id, message_id=msg.message_id, text=rep, parse_mode="HTML")
 
-
-# --- ГЛОБАЛЬНЫЙ ОБРАБОТЧИК ОШИБОК ---
 async def error_handler(update: object, context: ContextTypes.DEFAULT_TYPE) -> None:
     error = context.error
     if isinstance(error, TelegramError):
@@ -962,12 +1338,9 @@ async def error_handler(update: object, context: ContextTypes.DEFAULT_TYPE) -> N
     else:
         logging.error("❌ Неожиданная ошибка в боте:", exc_info=error)
 
-
-# --- ACTIVE-PASSIVE MAIN LOOP ---
 async def main():
     await app.initialize()
     await app.start()
-    
     is_active = False
     watch_task = None
     
@@ -982,18 +1355,15 @@ async def main():
     try:
         while True:
             await asyncio.sleep(LOCK_CHECK_INTERVAL)
-            
             if is_active:
                 if not maintain_lock(LOCK_FILE_PATH, INSTANCE_ID):
                     logging.warning("🔓 Failed to maintain lock. Stopping updater. PASSIVE mode.")
                     is_active = False
-                    
                     if watch_task:
                         watch_task.cancel()
                         with contextlib.suppress(asyncio.CancelledError):
                             await watch_task
                         watch_task = None
-                    
                     await app.updater.stop()
                     await asyncio.sleep(4)
             else:
@@ -1003,7 +1373,6 @@ async def main():
                     await app.updater.start_polling(drop_pending_updates=False)
                     watch_task = asyncio.create_task(watch_folder_task(app))
                     is_active = True
-                    
     except asyncio.CancelledError:
         logging.info("Main loop cancelled.")
     finally:
@@ -1013,32 +1382,22 @@ async def main():
             watch_task.cancel()
             with contextlib.suppress(asyncio.CancelledError):
                 await watch_task
-        
         release_lock(LOCK_FILE_PATH, INSTANCE_ID)
         await app.stop()
         await app.shutdown()
         logging.info("🛑 Bot shutdown complete.")
 
 if __name__ == "__main__":
-    request = HTTPXRequest(
-        connection_pool_size=8,
-        read_timeout=30.0,
-        write_timeout=30.0,
-        connect_timeout=30.0,
-        pool_timeout=30.0
-    )
-    
+    request = HTTPXRequest(connection_pool_size=8, read_timeout=30.0, write_timeout=30.0, connect_timeout=30.0, pool_timeout=30.0)
     app = ApplicationBuilder().token(TOKEN).request(request).build()
-    
     app.add_error_handler(error_handler)
-    
     app.add_handler(CommandHandler("setup", handle_setup))
+    app.add_handler(CommandHandler("status", handle_status))
     app.add_handler(CommandHandler("start", send_tags_menu))
     app.add_handler(CommandHandler("tags", send_tags_menu))
     app.add_handler(CallbackQueryHandler(callback_handler))
     app.add_handler(MessageHandler(filters.Entity("url") | filters.Entity("text_link"), handle_url))
     app.add_handler(MessageHandler(filters.TEXT & (~filters.COMMAND), handle_text))
     app.add_handler(MessageHandler(filters.PHOTO | filters.VIDEO | filters.VIDEO_NOTE | filters.Document.ALL, handle_any_media))
-    
-    print("Bot avviato (v47 - Caption to Description)...")
+    print("Bot avviato (v54 - Fixed Required Permissions List)...")
     asyncio.run(main())
