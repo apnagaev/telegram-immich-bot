@@ -15,7 +15,6 @@ from datetime import datetime
 from collections import defaultdict
 from io import BytesIO
 from PIL import Image, ExifTags
-from exif import Image as ExifImage
 from telegram import Update, InlineKeyboardMarkup, InlineKeyboardButton
 from telegram.error import RetryAfter, TelegramError
 from telegram.ext import ApplicationBuilder, ContextTypes, MessageHandler, filters, CommandHandler, CallbackQueryHandler
@@ -24,17 +23,14 @@ from telethon import TelegramClient
 from telegram.request import HTTPXRequest
 import contextlib
 
-
-# Telethon config
+# --- TELETHON CONFIG ---
 API_ID = int(os.getenv("TELEGRAM_API_ID", "0"))
 API_HASH = os.getenv("TELEGRAM_API_HASH", "")
 SESSION_NAME = "telegram_session"
 
-# Инициализация клиента Telethon
 telethon_client = None
 if API_ID and API_HASH:
     logging.info(f"🔧 Инициализация Telethon: API_ID={API_ID}, SESSION={SESSION_NAME}")
-    
     session_file = f"{SESSION_NAME}.session"
     if not os.path.exists(session_file):
         logging.error(f"❌ Файл сессии '{session_file}' не найден! Создайте его локально и пробросьте в контейнер.")
@@ -54,7 +50,6 @@ if API_ID and API_HASH:
             
             loop = asyncio.get_event_loop()
             telethon_client = loop.run_until_complete(init_telethon())
-            
         except Exception as e:
             logging.error(f"❌ Ошибка инициализации Telethon: {e}", exc_info=True)
             telethon_client = None
@@ -68,13 +63,14 @@ logging.basicConfig(
 )
 logging.getLogger("httpx").setLevel(logging.WARNING)
 logging.getLogger("PIL").setLevel(logging.WARNING)
+logging.getLogger("urllib3").setLevel(logging.WARNING)
 
 TOKEN = os.getenv("TELEGRAM_TOKEN")
 IMMICH_URL = os.getenv("IMMICH_URL").rstrip("/")
-API_KEY = os.getenv("IMMICH_API_KEY")
-ALBUM_ID = os.getenv("ALBUM_ID")
 IMPORT_DIR = os.getenv("IMPORT_DIR", "/import")
 HISTORY_FILE = os.path.join(IMPORT_DIR, "bot_history.json")
+USER_MAPPING_FILE = os.path.join(IMPORT_DIR, "user_mapping.json")
+
 ALLOWED_USER_IDS = [int(x.strip()) for x in os.getenv("ALLOWED_USER_IDS", "").split(",") if x.strip()]
 ADMIN_ID = ALLOWED_USER_IDS[0] if ALLOWED_USER_IDS else None
 
@@ -87,40 +83,75 @@ TEMP_DIR = "/tmp/bot_downloads"
 if os.path.exists(TEMP_DIR): shutil.rmtree(TEMP_DIR)
 os.makedirs(TEMP_DIR, exist_ok=True)
 
-ALBUM_CACHE = {}
 USER_TAGS_MEM = {}
+# Кэш альбомов теперь привязан к (имя_альбома, api_key), чтобы не путать альбомы разных пользователей
+ALBUM_CACHE = {}
 
-# --- ACTIVE-PASSIVE LOCK CONFIG ---
+if not all([TOKEN, IMMICH_URL]):
+    logging.error("Variabili d'ambiente mancanti (TOKEN, IMMICH_URL)!"); exit(1)
+
+# --- USER MAPPING FUNCTIONS ---
+def load_user_mapping() -> dict:
+    """Загружает или создает файл маппинга пользователей."""
+    if not os.path.exists(USER_MAPPING_FILE):
+        try:
+            with open(USER_MAPPING_FILE, 'w', encoding='utf-8') as f:
+                json.dump({}, f, indent=2)
+            logging.info(f"✅ Создан новый файл маппинга: {USER_MAPPING_FILE}")
+        except Exception as e:
+            logging.error(f"❌ Не удалось создать {USER_MAPPING_FILE}: {e}")
+            return {}
+    
+    try:
+        with open(USER_MAPPING_FILE, 'r', encoding='utf-8') as f:
+            return json.load(f)
+    except Exception as e:
+        logging.error(f"❌ Ошибка чтения {USER_MAPPING_FILE}: {e}")
+        return {}
+
+def save_user_mapping(mapping: dict):
+    """Сохраняет файл маппинга пользователей."""
+    try:
+        with open(USER_MAPPING_FILE, 'w', encoding='utf-8') as f:
+            json.dump(mapping, f, indent=2)
+    except Exception as e:
+        logging.error(f"❌ Ошибка сохранения {USER_MAPPING_FILE}: {e}")
+
+def get_user_config(telegram_user_id: int) -> dict:
+    """Ищет конфигурацию пользователя по Telegram ID. Возвращает None, если не найден."""
+    mapping = load_user_mapping()
+    for email, data in mapping.items():
+        if str(data.get("telegram_user_id")) == str(telegram_user_id):
+            return {
+                "email": email,
+                "api_key": data.get("immich_api_key"),
+                "max_user_id": data.get("max_user_id")
+            }
+    return None
+
+# --- LOCK MECHANISM ---
 LOCK_FILE_PATH = os.getenv("LOCK_FILE_PATH", "/shared_storage/bot.lock")
 INSTANCE_ID = os.getenv("HOSTNAME", str(uuid.uuid4()))
 LOCK_TIMEOUT = int(os.getenv("LOCK_TIMEOUT", "30"))
 LOCK_CHECK_INTERVAL = int(os.getenv("LOCK_CHECK_INTERVAL", "10"))
 
-if not all([TOKEN, IMMICH_URL, API_KEY]):
-    logging.error("Variabili d\'ambiente mancanti!"); exit(1)
-
-# --- LOCK MECHANISM ---
 def try_acquire_lock(lock_path, instance_id, timeout):
     try:
         os.makedirs(os.path.dirname(lock_path), exist_ok=True)
-        # Пытаемся атомарно создать файл
         fd = os.open(lock_path, os.O_CREAT | os.O_EXCL | os.O_WRONLY)
         with os.fdopen(fd, 'w') as f:
             json.dump({"instance_id": instance_id, "last_heartbeat": time.time()}, f)
         return True
     except FileExistsError:
-        # Файл существует, проверяем, не "протух" ли он
         try:
             with open(lock_path, 'r') as f:
                 data = json.load(f)
             if time.time() - data.get("last_heartbeat", 0) > timeout:
-                # Блокировка старая, перехватываем
                 with open(lock_path, 'w') as f:
                     json.dump({"instance_id": instance_id, "last_heartbeat": time.time()}, f)
                 return True
             return False
         except Exception:
-            # Если файл поврежден, пытаемся перезаписать
             try:
                 with open(lock_path, 'w') as f:
                     json.dump({"instance_id": instance_id, "last_heartbeat": time.time()}, f)
@@ -165,7 +196,7 @@ def fix_perms(path):
 def load_history():
     if not os.path.exists(HISTORY_FILE): return {"albums": [], "photographers": [], "last_chat_id": ADMIN_ID}
     try:
-        with open(HISTORY_FILE, 'r') as f: 
+        with open(HISTORY_FILE, 'r', encoding='utf-8') as f: 
             data = json.load(f)
             if "last_chat_id" not in data: data["last_chat_id"] = ADMIN_ID
             return data
@@ -173,7 +204,7 @@ def load_history():
 
 def save_history(data):
     try:
-        with open(HISTORY_FILE, 'w') as f: json.dump(data, f)
+        with open(HISTORY_FILE, 'w', encoding='utf-8') as f: json.dump(data, f)
     except Exception as e: logging.error(f"History save error: {e}")
 
 def update_history(album, photographer, chat_id=None):
@@ -194,23 +225,40 @@ def update_history(album, photographer, chat_id=None):
         changed = True
     if changed: save_history(data)
 
-def get_or_create_album(album_name):
-    if not album_name: return None
-    album_name = album_name.strip().strip('"').strip("'").strip()
-    album_name = re.sub(r"\.(zip|rar|7z|tar|gz|jpg|jpeg|png|heic|webp)$", "", album_name, flags=re.IGNORECASE)
-    if not album_name or len(album_name) < 2: return None
-    if album_name in ALBUM_CACHE: return ALBUM_CACHE[album_name]
-    headers = {"x-api-key": API_KEY, "Accept": "application/json"}
+def get_or_create_album(requested_name, api_key):
+    """Ищет альбом по имени. Если не находит, создает 'Telegram Upload'."""
+    if not requested_name or len(requested_name.strip()) < 2:
+        requested_name = "Telegram Upload"
+    
+    cache_key = (requested_name.lower(), api_key[:8]) # Упрощенный ключ кэша
+    if cache_key in ALBUM_CACHE:
+        return ALBUM_CACHE[cache_key]
+
+    headers = {"x-api-key": api_key, "Accept": "application/json"}
     try:
-        resp = requests.get(f"{IMMICH_URL}/api/albums", headers=headers)
+        # Пытаемся найти запрошенный альбом
+        resp = requests.get(f"{IMMICH_URL}/api/albums", headers=headers, timeout=10)
         if resp.status_code == 200:
             for album in resp.json():
-                if album["albumName"].lower() == album_name.lower():
-                    ALBUM_CACHE[album_name] = album["id"]; return album["id"]
-        cr = requests.post(f"{IMMICH_URL}/api/albums", headers=headers, json={"albumName": album_name})
+                if album["albumName"].lower() == requested_name.lower():
+                    ALBUM_CACHE[cache_key] = album["id"]
+                    return album["id"]
+        
+        # Если не нашли, создаем "Telegram Upload"
+        fallback_name = "Telegram Upload"
+        fallback_cache_key = (fallback_name.lower(), api_key[:8])
+        if fallback_cache_key in ALBUM_CACHE:
+            return ALBUM_CACHE[fallback_cache_key]
+
+        logging.info(f"Альбом '{requested_name}' не найден. Создаю '{fallback_name}'...")
+        cr = requests.post(f"{IMMICH_URL}/api/albums", headers=headers, json={"albumName": fallback_name}, timeout=10)
         if cr.status_code in [200, 201]:
-            nid = cr.json()["id"]; ALBUM_CACHE[album_name] = nid; return nid
-    except: pass
+            nid = cr.json()["id"]
+            ALBUM_CACHE[fallback_cache_key] = nid
+            return nid
+            
+    except Exception as e:
+        logging.error(f"Ошибка работы с альбомами: {e}")
     return None
 
 def parse_tags(text):
@@ -273,26 +321,27 @@ def calculate_checksum(file_path):
             sha1.update(data)
     return sha1.hexdigest()
 
-async def find_asset_by_checksum(checksum):
-    headers = {"x-api-key": API_KEY, "Accept": "application/json"}
+async def find_asset_by_checksum(checksum, api_key):
+    headers = {"x-api-key": api_key, "Accept": "application/json"}
     try:
-        resp = requests.post(f"{IMMICH_URL}/api/assets/check", headers=headers, json={"checksums": [checksum]})
+        resp = requests.post(f"{IMMICH_URL}/api/assets/check", headers=headers, json={"checksums": [checksum]}, timeout=15)
         if resp.status_code == 200:
             data = resp.json()
             if data.get("results") and len(data["results"]) > 0:
                 existing = data["results"][0]
                 if existing.get("action") == "reject":
                     return existing.get("assetId")
-    except: pass
+    except Exception as e:
+        logging.error(f"Ошибка проверки checksum: {e}")
     return None
 
 # --- UPLOAD ---
-async def upload_file_path_to_immich(file_path, original_name, telegram_date, message_id, override_date=None, extra_album=None, fotografo=None):
+async def upload_file_path_to_immich(file_path, original_name, telegram_date, message_id, user_api_key, override_date=None, extra_album=None, fotografo=None):
     try:
         if fotografo: logging.info(f"Uploading {original_name} with Photographer: {fotografo}")
         
         real_date = override_date or telegram_date
-        headers = {"x-api-key": API_KEY, "Accept": "application/json"}
+        headers = {"x-api-key": user_api_key, "Accept": "application/json"}
         
         with open(file_path, 'rb') as f:
             files = {"assetData": (original_name, f)}
@@ -303,7 +352,7 @@ async def upload_file_path_to_immich(file_path, original_name, telegram_date, me
                 "fileModifiedAt": real_date.isoformat(),
                 "isFavorite": "false",
             }
-            resp = requests.post(f"{IMMICH_URL}/api/assets", headers=headers, files=files, data=data)
+            resp = requests.post(f"{IMMICH_URL}/api/assets", headers=headers, files=files, data=data, timeout=60)
         
         asset_id = None
         status = "error"
@@ -315,41 +364,47 @@ async def upload_file_path_to_immich(file_path, original_name, telegram_date, me
                 status = "duplicate"
                 if not asset_id:
                     chk = calculate_checksum(file_path)
-                    asset_id = await find_asset_by_checksum(chk)
+                    asset_id = await find_asset_by_checksum(chk, user_api_key)
             else:
                 status = "success"
         elif resp.status_code == 409: 
              status = "duplicate"
              chk = calculate_checksum(file_path)
-             asset_id = await find_asset_by_checksum(chk)
+             asset_id = await find_asset_by_checksum(chk, user_api_key)
         
         if not asset_id: return status, None
 
         if fotografo:
             try:
-                requests.put(f"{IMMICH_URL}/api/assets/{asset_id}", headers=headers, json={"description": f"Fotografo: {fotografo}"})
+                requests.put(f"{IMMICH_URL}/api/assets/{asset_id}", headers=headers, json={"description": f"Fotografo: {fotografo}"}, timeout=10)
             except Exception as e: logging.error(f"Desc upd error: {e}")
 
         target_ids = []
-        if ALBUM_ID: target_ids.append(ALBUM_ID)
-        if extra_album:
-            aid = get_or_create_album(extra_album)
-            if aid: target_ids.append(aid)
+        # Всегда добавляем в запрошенный альбом (или "Telegram Upload", если не указан/не найден)
+        aid = get_or_create_album(extra_album, user_api_key)
+        if aid: target_ids.append(aid)
+        
         if fotografo:
-            fid = get_or_create_album(fotografo)
+            fid = get_or_create_album(fotografo, user_api_key)
             if fid: target_ids.append(fid)
         
         for alb_id in list(set(target_ids)):
             try:
-                requests.put(f"{IMMICH_URL}/api/albums/{alb_id}/assets", headers=headers, json={"ids": [asset_id]})
-            except Exception as e: logging.error(f"Alb upd error: {e}")
+                requests.put(f"{IMMICH_URL}/api/albums/{alb_id}/assets", headers=headers, json={"ids": [asset_id]}, timeout=10)
+            except Exception as e: 
+                logging.warning(f"Не удалось добавить в альбом {alb_id}: {e}")
 
         return status, asset_id
     except Exception as e: 
         logging.error(f"Upload error: {e}"); return "error", None
 
 # --- PROCESSORS ---
-async def process_directory_content(directory, msg_date, msg_id, manual_tags=None, bot=None, chat_id=None):
+async def process_directory_content(directory, msg_date, msg_id, user_config: dict, manual_tags=None, bot=None, chat_id=None):
+    if not user_config or not user_config.get("api_key"):
+        logging.error("Попытка обработки без конфигурации пользователя!")
+        return {"success": 0, "duplicate": 0, "error": 0, "unsupported": 0}, []
+
+    user_api_key = user_config["api_key"]
     total_stats = {"success": 0, "duplicate": 0, "error": 0, "unsupported": 0}
     current_job_albums = set()
     
@@ -364,10 +419,15 @@ async def process_directory_content(directory, msg_date, msg_id, manual_tags=Non
                     if not is_file_stable(full_p, wait_time=2): continue
                     ext_to = os.path.join(root, "extracted_" + file)
                     os.makedirs(ext_to, exist_ok=True); fix_perms(ext_to)
-                    try: patoolib.extract_archive(full_p, outdir=ext_to); os.remove(full_p); has_archives = True; await asyncio.sleep(5)
+                    try: 
+                        patoolib.extract_archive(full_p, outdir=ext_to)
+                        os.remove(full_p)
+                        has_archives = True
+                        await asyncio.sleep(5)
                     except Exception as e:
                         logging.error(f"Ошибка распаковки {full_p}: {e}")
                         total_stats["error"] += 1
+                        
     all_items = []
     for root, dirs, files in os.walk(directory):
         dirs[:] = [d for d in dirs if d not in ["corrupted", "failed_extraction", "unsupported_files"]]
@@ -401,7 +461,12 @@ async def process_directory_content(directory, msg_date, msg_id, manual_tags=Non
                 try: fb_date = datetime.fromtimestamp(os.path.getmtime(full_p))
                 except: pass
             
-            status, _ = await upload_file_path_to_immich(full_p, file, fb_date, f"{msg_id}-{file}", extra_album=final_alb, fotografo=final_foto)
+            status, _ = await upload_file_path_to_immich(
+                full_p, file, fb_date, f"{msg_id}-{file}", 
+                user_api_key=user_api_key, 
+                extra_album=final_alb, fotografo=final_foto
+            )
+            
             if status in ["success", "duplicate"]:
                 try: os.remove(full_p)
                 except: pass
@@ -415,7 +480,7 @@ async def process_directory_content(directory, msg_date, msg_id, manual_tags=Non
                 except: pass
             await asyncio.sleep(1)
         else:
-            if root == IMPORT_DIR and (file == "put_files_here.txt" or file == "bot_history.json"): continue
+            if root == IMPORT_DIR and (file == "put_files_here.txt" or file == "bot_history.json" or file == "user_mapping.json"): continue
             unsupported_dir = os.path.join(IMPORT_DIR, "unsupported_files")
             os.makedirs(unsupported_dir, exist_ok=True)
             try: shutil.move(full_p, os.path.join(unsupported_dir, file)); total_stats["unsupported"] += 1
@@ -431,6 +496,7 @@ async def process_directory_content(directory, msg_date, msg_id, manual_tags=Non
             if name in ["corrupted", "failed_extraction", "unsupported_files", "jdownloader", "tg-immich-bot"] or d_path == directory: continue
             try: os.rmdir(d_path)
             except: pass
+            
     return total_stats, list(current_job_albums)
 
 # --- WATCH FOLDER TASK ---
@@ -441,8 +507,9 @@ async def watch_folder_task(app):
             await asyncio.sleep(30)
             if not os.path.exists(IMPORT_DIR): continue
             items = os.listdir(IMPORT_DIR)
-            relevant = [i for i in items if i not in special_dirs and i != "put_files_here.txt" and i != "bot_history.json"]
+            relevant = [i for i in items if i not in special_dirs and i not in ["put_files_here.txt", "bot_history.json", "user_mapping.json"]]
             if not relevant: continue
+            
             has_valid_content = False
             for root, dirs, files in os.walk(IMPORT_DIR):
                 dirs[:] = [d for d in dirs if d not in special_dirs]
@@ -452,12 +519,32 @@ async def watch_folder_task(app):
                         if is_file_stable(os.path.join(root, file), wait_time=2):
                             has_valid_content = True; break
                 if has_valid_content: break
+                
             if not has_valid_content: continue
+            
+            # Для watch folder используем первого настроенного пользователя из ALLOWED_USER_IDS
+            default_user_config = None
+            for uid in ALLOWED_USER_IDS:
+                cfg = get_user_config(uid)
+                if cfg:
+                    default_user_config = cfg
+                    break
+            
+            if not default_user_config:
+                logging.warning("⚠️ Watch folder: файлы обнаружены, но ни один из админов не настроил аккаунт через /setup. Пропуск.")
+                continue
+
             hist = load_history(); target_chat = hist.get("last_chat_id", ADMIN_ID)
             if target_chat:
-                try: await app.bot.send_message(chat_id=target_chat, text=f"📂 <b>Importazione Automatica Iniziata!</b>", parse_mode="HTML")
+                try: await app.bot.send_message(chat_id=target_chat, text=f"📂 <b>Importazione Automatica Iniziata!</b> (User: {default_user_config['email']})", parse_mode="HTML")
                 except: pass
-            stats, albums = await process_directory_content(IMPORT_DIR, datetime.now(), "watchdog", bot=app.bot, chat_id=target_chat)
+                
+            stats, albums = await process_directory_content(
+                IMPORT_DIR, datetime.now(), "watchdog", 
+                user_config=default_user_config, 
+                bot=app.bot, chat_id=target_chat
+            )
+            
             if target_chat and (sum(stats.values()) > 0):
                 report = f"📂 <b>Importazione Completata!</b>\n✅ {stats['success']} Caricati\n♻️ {stats['duplicate']} Duplicati"
                 if albums: report += f"\n📂 <b>Album:</b> {', '.join(albums)}"
@@ -470,6 +557,79 @@ async def watch_folder_task(app):
             break
 
 # --- HANDLERS ---
+async def handle_setup(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Обрабатывает команду /setup <api_key>"""
+    user_id = update.effective_user.id
+    if user_id not in ALLOWED_USER_IDS:
+        await update.message.reply_text("❌ У вас нет доступа к этому боту.")
+        return
+    
+    args = context.args
+    if not args:
+        await update.message.reply_text(
+            "⚙️ <b>Настройка аккаунта Immich</b>\n\n"
+            "Используйте команду:\n"
+            "<code>/setup ВАШ_API_КЛЮЧ</code>\n\n"
+            "Где взять ключ:\n"
+            "1. Откройте Immich\n"
+            "2. Перейдите в Настройки -> Безопасность -> Ключи API\n"
+            "3. Создайте новый ключ и скопируйте его сюда.",
+            parse_mode="HTML"
+        )
+        return
+    
+    api_key = args[0]
+    headers = {"x-api-key": api_key, "Accept": "application/json"}
+    
+    await update.message.reply_text("⏳ Проверяю ключ и получаю данные аккаунта...")
+    
+    try:
+        resp = requests.get(f"{IMMICH_URL}/api/users/me", headers=headers, timeout=10)
+        if resp.status_code == 200:
+            user_info = resp.json()
+            email = user_info.get("email")
+            
+            if not email:
+                await update.message.reply_text("❌ Не удалось получить email из Immich. Проверьте ключ.")
+                return
+            
+            mapping = load_user_mapping()
+            mapping[email] = {
+                "immich_api_key": api_key,
+                "telegram_user_id": user_id,
+                "max_user_id": None
+            }
+            save_user_mapping(mapping)
+            
+            await update.message.reply_text(
+                f"✅ <b>Аккаунт успешно настроен!</b>\n\n"
+                f"📧 Email: <code>{email}</code>\n"
+                f"🆔 Telegram ID: <code>{user_id}</code>\n\n"
+                f"Теперь вы можете отправлять фото и видео, и они будут загружаться в ваш личный профиль Immich.",
+                parse_mode="HTML"
+            )
+        else:
+            await update.message.reply_text(f"❌ Неверный API ключ или ошибка подключения к Immich. (Код ответа: {resp.status_code})\nПроверьте ключ и переменную IMMICH_URL.")
+    except requests.exceptions.ConnectionError:
+        await update.message.reply_text("❌ Не удалось подключиться к Immich. Проверьте переменную IMMICH_URL в настройках бота.")
+    except Exception as e:
+        await update.message.reply_text(f"❌ Ошибка при проверке ключа: {e}")
+
+async def send_tags_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if update.effective_user.id not in ALLOWED_USER_IDS: return
+    
+    # Проверяем, настроен ли пользователь
+    if not get_user_config(update.effective_user.id):
+        await update.message.reply_text("⚠️ Ваш аккаунт не настроен. Используйте команду /setup <api_key> для начала работы.")
+        return
+
+    update_history(None, None, update.effective_chat.id)
+    curr = USER_TAGS_MEM.get(update.effective_user.id, {}).get("tags", [None, None])
+    msg_text = "🗂 <b>Gestione Tag</b>\nSeleziona album o fotografo dai tasti sotto."
+    if curr[0] or curr[1]:
+        msg_text += f"\n\n🔹 <b>Attivi:</b>\n📂 Album: {curr[0] or '--'}\n👤 Foto: {curr[1] or '--'}"
+    await update.message.reply_text(msg_text, reply_markup=await get_tags_markup(update.effective_user.id), parse_mode="HTML")
+
 async def get_tags_markup(user_id):
     data = load_history()
     curr = USER_TAGS_MEM.get(user_id, {}).get("tags", [None, None])
@@ -493,19 +653,15 @@ async def get_tags_markup(user_id):
     keyboard.append([InlineKeyboardButton("🗑 Cancella Tag", callback_data="reset_tags")])
     return InlineKeyboardMarkup(keyboard)
 
-async def send_tags_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if update.effective_user.id not in ALLOWED_USER_IDS: return
-    update_history(None, None, update.effective_chat.id)
-    curr = USER_TAGS_MEM.get(update.effective_user.id, {}).get("tags", [None, None])
-    msg_text = "🗂 <b>Gestione Tag</b>\nSeleziona album o fotografo dai tasti sotto."
-    if curr[0] or curr[1]:
-        msg_text += f"\n\n🔹 <b>Attivi:</b>\n📂 Album: {curr[0] or '--'}\n👤 Foto: {curr[1] or '--'}"
-    await update.message.reply_text(msg_text, reply_markup=await get_tags_markup(update.effective_user.id), parse_mode="HTML")
-
 async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query; await query.answer()
     user_id = update.effective_user.id
     if user_id not in ALLOWED_USER_IDS: return
+    
+    if not get_user_config(user_id):
+        await query.answer("Аккаунт не настроен!", show_alert=True)
+        return
+
     data = query.data; hist = load_history()
     curr = USER_TAGS_MEM.get(user_id, {"tags": [None, None], "time": time.time()})
     if data == "reset_tags": curr["tags"] = [None, None]
@@ -526,6 +682,11 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if update.effective_user.id not in ALLOWED_USER_IDS: return
+    
+    if not get_user_config(update.effective_user.id):
+        await update.message.reply_text("⚠️ Ваш аккаунт не настроен. Используйте команду /setup <api_key> для начала работы.")
+        return
+
     text = update.message.text
     if len(text) > 200: return
     ta, tf = parse_tags(text)
@@ -539,9 +700,19 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def handle_any_media(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if update.effective_user.id not in ALLOWED_USER_IDS: return
+    
+    user_config = get_user_config(update.effective_user.id)
+    if not user_config:
+        await update.message.reply_text(
+            "⚠️ <b>Аккаунт не настроен!</b>\n\n"
+            "Прежде чем отправлять файлы, настройте свой аккаунт Immich:\n"
+            "<code>/setup ВАШ_API_КЛЮЧ</code>",
+            parse_mode="HTML"
+        )
+        return
+
     update_history(None, None, update.effective_chat.id)
     msg = update.message; tags = get_effective_tags(update.effective_user.id, msg.caption or "")
-    used_albums = [t for t in tags if t] if tags else []
     file_obj = None; fname = "file.jpg"
     
     if msg.document:
@@ -560,7 +731,11 @@ async def handle_any_media(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 try:
                     telethon_msg = await telethon_client.get_messages(msg.chat_id, ids=msg.message_id)
                     await telethon_client.download_media(telethon_msg, file=dest_path)
-                    stats, albums = await process_directory_content(job_dir, msg.date, msg.message_id, manual_tags=tags, bot=context.bot, chat_id=msg.chat_id)
+                    stats, albums = await process_directory_content(
+                        job_dir, msg.date, msg.message_id, 
+                        user_config=user_config, 
+                        manual_tags=tags, bot=context.bot, chat_id=msg.chat_id
+                    )
                     shutil.rmtree(job_dir)
                     rep = f"📦 <b>Большой архив обработан!</b>\n✅ {stats['success']} Фото\n♻️ {stats['duplicate']} Дубликатов"
                     if albums: rep += f"\n📂 <b>Альбомы:</b> {', '.join(albums)}"
@@ -600,6 +775,7 @@ async def handle_any_media(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 await telethon_client.download_media(telethon_msg, file=dest_path)
                 status, _ = await upload_file_path_to_immich(
                     dest_path, fname, msg.date, msg.message_id,
+                    user_api_key=user_config["api_key"],
                     extra_album=tags[0] if tags and tags[0] else None,
                     fotografo=tags[1] if tags and len(tags) > 1 else None
                 )
@@ -634,14 +810,23 @@ async def handle_any_media(update: Update, context: ContextTypes.DEFAULT_TYPE):
             job_dir = os.path.join(TEMP_DIR, f"zip_{msg.message_id}"); os.makedirs(job_dir, exist_ok=True)
             sm = await msg.reply_text("⏳ <b>Archivio ricevuto...</b>", parse_mode="HTML")
             await file_obj.download_to_drive(os.path.join(job_dir, fname))
-            stats, albums = await process_directory_content(job_dir, msg.date, msg.message_id, manual_tags=tags, bot=context.bot, chat_id=msg.chat_id)
+            stats, albums = await process_directory_content(
+                job_dir, msg.date, msg.message_id, 
+                user_config=user_config, 
+                manual_tags=tags, bot=context.bot, chat_id=msg.chat_id
+            )
             shutil.rmtree(job_dir)
             rep = f"📦 <b>Elaborato!</b>\n✅ {stats['success']} Foto\n♻️ {stats['duplicate']} Duplicati"
             if albums: rep += f"\n📂 <b>Album:</b> {', '.join(albums)}"
             await context.bot.edit_message_text(chat_id=msg.chat_id, message_id=sm.message_id, text=rep, parse_mode="HTML")
         else:
             tmp = os.path.join(TEMP_DIR, fname); await file_obj.download_to_drive(tmp)
-            status, _ = await upload_file_path_to_immich(tmp, fname, msg.date, msg.message_id, extra_album=tags[0] if tags and tags[0] else None, fotografo=tags[1] if tags and len(tags)>1 else None)
+            status, _ = await upload_file_path_to_immich(
+                tmp, fname, msg.date, msg.message_id, 
+                user_api_key=user_config["api_key"], 
+                extra_album=tags[0] if tags and tags[0] else None, 
+                fotografo=tags[1] if tags and len(tags)>1 else None
+            )
             os.remove(tmp)
             report = "✅ Caricata!" if status == "success" else "♻️ Duplicata (Tag Aggiornati)."
             if tags and tags[0]: report += f"\n📂 Album: {tags[0]}"
@@ -650,6 +835,12 @@ async def handle_any_media(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def handle_url(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if update.effective_user.id not in ALLOWED_USER_IDS: return
+    
+    user_config = get_user_config(update.effective_user.id)
+    if not user_config:
+        await update.message.reply_text("⚠️ Ваш аккаунт не настроен. Используйте команду /setup <api_key> для начала работы.")
+        return
+
     update_history(None, None, update.effective_chat.id)
     url_m = re.search(r'(https?://\S+)', update.message.text)
     if not url_m: return
@@ -660,6 +851,7 @@ async def handle_url(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if ok: await update.message.reply_text(f"🦅 <b>JDownloader:</b> Inviato!", parse_mode="HTML")
         else: await update.message.reply_text(f"🦅 <b>JDownloader Errore:</b> {msg}", parse_mode="HTML")
         return
+    
     job_dir = os.path.join(TEMP_DIR, f"job_{update.message.message_id}"); os.makedirs(job_dir, exist_ok=True)
     msg = await update.message.reply_text("⏳ <b>Link ricevuto...</b>", parse_mode="HTML")
     success = False
@@ -706,7 +898,11 @@ async def handle_url(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 except Exception as e:
                     logging.warning(f"Не удалось переименовать {fname}: {e}")
                     
-    stats, albums = await process_directory_content(job_dir, update.message.date, update.message.message_id, manual_tags=tags, bot=context.bot, chat_id=update.message.chat_id)
+    stats, albums = await process_directory_content(
+        job_dir, update.message.date, update.message.message_id, 
+        user_config=user_config, 
+        manual_tags=tags, bot=context.bot, chat_id=update.message.chat_id
+    )
     shutil.rmtree(job_dir)
     rep = f"✅ <b>Completato!</b>\n{stats['success']} Caricati\n{stats['duplicate']} Duplicati (Aggiornati)"
     if albums: rep += f"\n📂 Album: {', '.join(albums)}"
@@ -724,17 +920,6 @@ async def error_handler(update: object, context: ContextTypes.DEFAULT_TYPE) -> N
     else:
         logging.error("❌ Неожиданная ошибка в боте:", exc_info=error)
 
-
-# --- ГЛОБАЛЬНЫЙ ОБРАБОТЧИК ОШИБОК ---
-async def error_handler(update: object, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Перехватывает и смягчает логирование известных сетевых ошибок."""
-    error = context.error
-    if isinstance(error, telegram.error.Conflict):
-        logging.warning("⚠️ Telegram Conflict: другой экземпляр уже опрашивает обновления. Ожидаем стабилизации...")
-    elif isinstance(error, telegram.error.NetworkError):
-        logging.warning(f"⚠️ Сетевая ошибка Telegram: {error}. Повторная попытка будет выполнена автоматически.")
-    else:
-        logging.error("❌ Неожиданная ошибка в боте:", exc_info=error)
 
 # --- ACTIVE-PASSIVE MAIN LOOP ---
 async def main():
@@ -758,34 +943,22 @@ async def main():
             await asyncio.sleep(LOCK_CHECK_INTERVAL)
             
             if is_active:
-                # Пытаемся продлить блокировку
                 if not maintain_lock(LOCK_FILE_PATH, INSTANCE_ID):
                     logging.warning("🔓 Failed to maintain lock (storage latency or takeover). Stopping updater. PASSIVE mode.")
                     is_active = False
                     
-                    # 1. Сначала отменяем фоновые задачи
                     if watch_task:
                         watch_task.cancel()
                         with contextlib.suppress(asyncio.CancelledError):
                             await watch_task
                         watch_task = None
                     
-                    # 2. Останавливаем updater
                     await app.updater.stop()
-                    
-                    # 3. КРИТИЧЕСКИ ВАЖНО: даем 3-5 секунд, чтобы запрос Long Polling 
-                    # на серверах Telegram успел завершиться и освободить сессию.
-                    # Это предотвращает ошибку "Conflict" у следующего экземпляра.
                     await asyncio.sleep(4)
             else:
-                # Пытаемся захватить блокировку
                 if try_acquire_lock(LOCK_FILE_PATH, INSTANCE_ID, LOCK_TIMEOUT):
                     logging.info("🔒 Lock acquired. Starting updater. ACTIVE mode.")
-                    
-                    # 4. КРИТИЧЕСКИ ВАЖНО: небольшая пауза перед стартом, 
-                    # чтобы убедиться, что предыдущий экземпляр полностью "отпустил" API Telegram.
                     await asyncio.sleep(3)
-                    
                     await app.updater.start_polling(drop_pending_updates=False)
                     watch_task = asyncio.create_task(watch_folder_task(app))
                     is_active = True
@@ -793,7 +966,6 @@ async def main():
     except asyncio.CancelledError:
         logging.info("Main loop cancelled.")
     finally:
-        # Корректное завершение работы
         if is_active:
             await app.updater.stop()
         if watch_task and not watch_task.done():
@@ -807,8 +979,6 @@ async def main():
         logging.info("🛑 Bot shutdown complete.")
 
 if __name__ == "__main__":
-    from telegram.request import HTTPXRequest
-    
     request = HTTPXRequest(
         connection_pool_size=8,
         read_timeout=30.0,
@@ -819,15 +989,15 @@ if __name__ == "__main__":
     
     app = ApplicationBuilder().token(TOKEN).request(request).build()
     
-    # Регистрируем наш мягкий обработчик ошибок
     app.add_error_handler(error_handler)
     
-    app.add_handler(CommandHandler("tags", send_tags_menu))
+    app.add_handler(CommandHandler("setup", handle_setup))
     app.add_handler(CommandHandler("start", send_tags_menu))
+    app.add_handler(CommandHandler("tags", send_tags_menu))
     app.add_handler(CallbackQueryHandler(callback_handler))
     app.add_handler(MessageHandler(filters.Entity("url") | filters.Entity("text_link"), handle_url))
     app.add_handler(MessageHandler(filters.TEXT & (~filters.COMMAND), handle_text))
     app.add_handler(MessageHandler(filters.PHOTO | filters.VIDEO | filters.VIDEO_NOTE | filters.Document.ALL, handle_any_media))
     
-    print("Bot avviato (v44 - Active-Passive HA Stabilized)...")
+    print("Bot avviato (v45 - Multi-User Strict Mapping)...")
     asyncio.run(main())
