@@ -29,32 +29,31 @@ API_HASH = os.getenv("TELEGRAM_API_HASH", "")
 SESSION_NAME = "telegram_session"
 
 telethon_client = None
-if API_ID and API_HASH:
-    logging.info(f"🔧 Инициализация Telethon: API_ID={API_ID}, SESSION={SESSION_NAME}")
-    session_file = f"{SESSION_NAME}.session"
-    if not os.path.exists(session_file):
-        logging.error(f"❌ Файл сессии '{session_file}' не найден! Создайте его локально и пробросьте в контейнер.")
-    else:
-        try:
-            telethon_client = TelegramClient(SESSION_NAME, API_ID, API_HASH)
-            
-            async def init_telethon():
+
+async def init_telethon_client():
+    """Инициализирует Telethon в том же event loop, что и бот."""
+    global telethon_client
+    if API_ID and API_HASH:
+        logging.info(f"🔧 Инициализация Telethon: API_ID={API_ID}, SESSION={SESSION_NAME}")
+        session_file = f"{SESSION_NAME}.session"
+        if not os.path.exists(session_file):
+            logging.error(f"❌ Файл сессии '{session_file}' не найден! Создайте его локально и пробросьте в контейнер.")
+        else:
+            try:
+                telethon_client = TelegramClient(SESSION_NAME, API_ID, API_HASH)
                 await telethon_client.connect()
                 logging.info("✅ Telethon подключен")
                 if not await telethon_client.is_user_authorized():
                     logging.error("❌ Telethon не авторизован! Файл сессии недействителен.")
                     await telethon_client.disconnect()
-                    return None
-                logging.info("✅ Telethon авторизован и готов к работе")
-                return telethon_client
-            
-            loop = asyncio.get_event_loop()
-            telethon_client = loop.run_until_complete(init_telethon())
-        except Exception as e:
-            logging.error(f"❌ Ошибка инициализации Telethon: {e}", exc_info=True)
-            telethon_client = None
-else:
-    logging.warning("⚠️ TELEGRAM_API_ID или TELEGRAM_API_HASH не заданы")
+                    telethon_client = None
+                else:
+                    logging.info("✅ Telethon авторизован и готов к работе")
+            except Exception as e:
+                logging.error(f"❌ Ошибка инициализации Telethon: {e}", exc_info=True)
+                telethon_client = None
+    else:
+        logging.warning("⚠️ TELEGRAM_API_ID или TELEGRAM_API_HASH не заданы")
 
 # --- CONFIGURAZIONE ---
 logging.basicConfig(
@@ -1070,6 +1069,25 @@ async def handle_status(update: Update, context: ContextTypes.DEFAULT_TYPE):
         api_key = user_config["api_key"]
         masked_key = api_key[:6] + "••••••••" + api_key[-4:] if len(api_key) > 12 else "••••••"
         status_text += f"🔑 <b>API Key:</b> <code>{masked_key}</code>\n"
+        
+        # --- СТАТУС TELETHON ---
+        status_text += "\n📱 <b>Статус Telethon:</b>\n"
+        if telethon_client is not None:
+            try:
+                is_connected = telethon_client.is_connected()
+                is_authorized = await telethon_client.is_user_authorized()
+                if is_connected and is_authorized:
+                    status_text += "✅ <b>Подключен и авторизован</b> (готов к загрузке файлов >20 МБ)\n"
+                elif is_connected and not is_authorized:
+                    status_text += "⚠️ <b>Подключен, но не авторизован</b> (проверьте файл сессии .session)\n"
+                else:
+                    status_text += "❌ <b>Не подключен</b>\n"
+            except Exception as e:
+                status_text += f"❌ <b>Ошибка проверки:</b> {str(e)[:60]}\n"
+        else:
+            status_text += "⚠️ <b>Не настроен</b> (отсутствуют API_ID/API_HASH или файл сессии)\n"
+        # ----------------------
+        
         status_text += f"\n<b>Проверка прав API-ключа:</b>\n{permissions_report}\n\n"
         
         if not has_failure:
@@ -1274,11 +1292,26 @@ async def handle_url(update: Update, context: ContextTypes.DEFAULT_TYPE):
     url_m = re.search(r'(https?://\S+)', update.message.text)
     if not url_m: return
     url = url_m.group(1); tags = get_effective_tags(user_id, update.message.text)
-    JD_DOMAINS = ["mobidrive.com", "fromsmash.com", "swisstransfer.com", "mega.nz", "drive.google.com", "dropbox.com", "1fichier.com", "filecrypt.cc", "mediafire.com"]
+    
+    # --- РАСШИРЕННЫЙ СПИСОК ДОМЕНОВ ДЛЯ JDOWNLOADER ---
+    JD_DOMAINS = [
+        "drive.google.com", "docs.google.com", "googledrive.com",
+        "mega.nz", "mega.co.nz",
+        "dropbox.com", "dropboxusercontent.com",
+        "1fichier.com", "filecrypt.cc",
+        "mediafire.com",
+        "swisstransfer.com", "fromsmash.com", "wetransfer.com", "we.tl",
+        "mobidrive.com",
+        "yadi.sk", "disk.yandex.ru", "cloud.mail.ru",
+        "onedrive.live.com", "sharepoint.com", "box.com", "pcloud.com"
+    ]
+    
     if any(d in url for d in JD_DOMAINS) or "/jd" in update.message.text:
         ok, msg = send_to_jdownloader(url, tags=tags)
-        if ok: await update.message.reply_text(f"🦅 <b>JDownloader:</b> Inviato!", parse_mode="HTML")
-        else: await update.message.reply_text(f"🦅 <b>JDownloader Errore:</b> {msg}", parse_mode="HTML")
+        if ok: 
+            await update.message.reply_text(f"🦅 <b>JDownloader:</b> Ссылка успешно отправлена на загрузку!", parse_mode="HTML")
+        else: 
+            await update.message.reply_text(f"🦅 <b>JDownloader Errore:</b> {msg}", parse_mode="HTML")
         return
     
     job_dir = os.path.join(TEMP_DIR, f"job_{update.message.message_id}"); os.makedirs(job_dir, exist_ok=True)
@@ -1339,6 +1372,9 @@ async def error_handler(update: object, context: ContextTypes.DEFAULT_TYPE) -> N
         logging.error("❌ Неожиданная ошибка в боте:", exc_info=error)
 
 async def main():
+    # Инициализируем Telethon в том же event loop, что и бот
+    await init_telethon_client()
+    
     await app.initialize()
     await app.start()
     is_active = False
@@ -1399,5 +1435,5 @@ if __name__ == "__main__":
     app.add_handler(MessageHandler(filters.Entity("url") | filters.Entity("text_link"), handle_url))
     app.add_handler(MessageHandler(filters.TEXT & (~filters.COMMAND), handle_text))
     app.add_handler(MessageHandler(filters.PHOTO | filters.VIDEO | filters.VIDEO_NOTE | filters.Document.ALL, handle_any_media))
-    print("Bot avviato (v54 - Fixed Required Permissions List)...")
+    print("Bot avviato (v56 - Fixed Telethon Event Loop Issue)...")
     asyncio.run(main())
