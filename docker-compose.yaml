@@ -1,0 +1,23 @@
+name: immich
+services:
+  telegram-immich-bot:
+    image: immichtelebot:latest
+    container_name: telegram-immich-bot
+    restart: unless-stopped
+    environment:
+      - TELEGRAM_TOKEN=111111111111:111111111111111
+      - IMMICH_URL=https://immich.example.org
+      - IMPORT_DIR=/import
+      - TZ=Europe/Moscow
+      - TELEGRAM_API_ID=1111111111
+      - TELEGRAM_API_HASH=111111111111111
+      - MYJD_USER=user@example.org
+      - MYJD_PASSWORD=11111111111
+      - MYJD_DEVICE=immichdevice
+      - LOCK_FILE_PATH=/import/lock.lock
+      - LOCK_TIMEOUT=60
+      - LOCK_CHECK_INTERVAL=20
+    volumes:
+      - /immich/telegrambot:/import
+      - ./telegram_session.session:/app/telegram_session.session
+
