@@ -39,7 +39,8 @@ HISTORY_FILE = os.path.join(IMPORT_DIR, "bot_history.json")
 USER_MAPPING_FILE = os.path.join(IMPORT_DIR, "user_mapping.json")
 
 TEMP_DIR = "/tmp/bot_downloads"
-if os.path.exists(TEMP_DIR): shutil.rmtree(TEMP_DIR)
+if os.path.exists(TEMP_DIR):
+    shutil.rmtree(TEMP_DIR)
 os.makedirs(TEMP_DIR, exist_ok=True)
 
 # INSTANCE_ID ДОЛЖЕН быть объявлен ДО использования в Telethon
@@ -51,12 +52,13 @@ API_HASH = os.getenv("TELEGRAM_API_HASH", "")
 SESSION_NAME = "telegram_session"
 
 telethon_client = None
-TELETHON_SEMAPHORE = asyncio.Semaphore(3)
+TELETHON_SEMAPHORE = asyncio.Semaphore(3)  # Максимум 3 параллельные загрузки
 
 async def init_telethon_client():
     """
     Каждый экземпляр копирует сессию в /tmp с уникальным суффиксом,
     чтобы контейнеры не дрались за одну базу SQLite.
+    Инициализация происходит в том же event loop, что и бот.
     """
     global telethon_client
     if not (API_ID and API_HASH):
@@ -68,7 +70,6 @@ async def init_telethon_client():
         logging.error(f"❌ Файл сессии '{src}' не найден! Создайте его локально и пробросьте в контейнер.")
         return
 
-    # Уникальное имя на инстанс
     suffix = hashlib.md5(INSTANCE_ID.encode()).hexdigest()[:8]
     local_session = f"/tmp/{SESSION_NAME}_{suffix}"
 
@@ -95,7 +96,7 @@ async def init_telethon_client():
 
 # --- GLOBALS ---
 USER_TAGS_MEM = {}
-ALBUM_CACHE = {}
+ALBUM_CACHE = {}  # Ключ: (api_key_hash, album_name_lower)
 
 # Финальный минимальный список разрешений (ровно 10)
 REQUIRED_PERMISSIONS = {
@@ -112,11 +113,12 @@ REQUIRED_PERMISSIONS = {
 }
 
 if not TOKEN:
-    logging.error("Variabile d'ambiente TELEGRAM_TOKEN mancante!"); exit(1)
+    logging.error("Variabile d'ambiente TELEGRAM_TOKEN mancante!")
+    exit(1)
 
-# --- USER MAPPING FUNCTIONS ---
+# --- ATOMIC JSON WRITE ---
 def _atomic_json_write(filepath, data):
-    """Атомарная запись JSON с файловой блокировкой."""
+    """Атомарная запись JSON с файловой блокировкой для предотвращения race conditions."""
     temp_path = f"{filepath}.tmp.{os.getpid()}"
     lock_path = f"{filepath}.lock"
     try:
@@ -131,9 +133,12 @@ def _atomic_json_write(filepath, data):
     except Exception as e:
         logging.error(f"Atomic write error for {filepath}: {e}")
         if os.path.exists(temp_path):
-            try: os.remove(temp_path)
-            except: pass
+            try:
+                os.remove(temp_path)
+            except:
+                pass
 
+# --- USER MAPPING FUNCTIONS ---
 def load_user_mapping() -> dict:
     if not os.path.exists(USER_MAPPING_FILE):
         try:
@@ -163,6 +168,71 @@ def get_user_config(telegram_user_id: int) -> dict:
                 "max_user_id": data.get("max_user_id")
             }
     return None
+
+# --- TELETHON SAFE HELPERS ---
+async def telethon_get_message_safe(chat_id, message_id, retries=3, delay=2):
+    """
+    Надёжное получение сообщения через Telethon с повторными попытками.
+    """
+    if telethon_client is None:
+        raise Exception("Telethon не инициализирован")
+
+    if not telethon_client.is_connected():
+        logging.warning("🔄 Telethon отключен — переподключаюсь")
+        await telethon_client.connect()
+        if not await telethon_client.is_user_authorized():
+            raise Exception("Telethon не авторизован после переподключения")
+
+    entity = chat_id
+
+    for attempt in range(1, retries + 1):
+        try:
+            msg = await telethon_client.get_messages(entity, ids=message_id)
+            if msg is not None:
+                logging.info(f"✅ Telethon нашёл сообщение {message_id} в чате {chat_id} (попытка {attempt})")
+                return msg
+            else:
+                logging.warning(f"⚠️ Telethon вернул None для {message_id} в {chat_id} (попытка {attempt}/{retries})")
+        except Exception as e:
+            logging.warning(f"⚠️ Telethon get_messages ошибка (попытка {attempt}/{retries}): {e}")
+
+        if attempt < retries:
+            await asyncio.sleep(delay)
+
+    # Запасной вариант: получить последнее сообщение
+    try:
+        logging.info(f"🔍 Пробуем получить последнее сообщение в чате {chat_id}")
+        last_msgs = await telethon_client.get_messages(entity, limit=1)
+        if last_msgs and len(last_msgs) > 0:
+            found = last_msgs[0]
+            logging.info(f"✅ Получено последнее сообщение id={found.id} (ожидалось {message_id})")
+            return found
+    except Exception as e:
+        logging.error(f"❌ Не удалось получить даже последнее сообщение: {e}")
+
+    raise Exception(f"Telethon не смог получить сообщение {message_id} из чата {chat_id} после {retries} попыток")
+
+async def telethon_download_to_path(message, dest_path):
+    """Скачивает медиа из сообщения и возвращает реальный путь к файлу."""
+    result = await telethon_client.download_media(message, file=dest_path)
+    logging.info(f"⬇️ download_media вернул: {result!r}")
+
+    if not result:
+        raise Exception("download_media вернул None")
+
+    final_path = result if isinstance(result, str) else dest_path
+
+    if final_path != dest_path and os.path.exists(final_path):
+        shutil.move(final_path, dest_path)
+        logging.info(f"📦 Перемещено: {final_path} → {dest_path}")
+        final_path = dest_path
+
+    if not os.path.exists(dest_path):
+        raise Exception(f"Файл не появился на диске: {dest_path}")
+    if os.path.getsize(dest_path) == 0:
+        raise Exception(f"Файл пустой: {dest_path}")
+
+    return dest_path
 
 # --- PERMISSION CHECK FUNCTIONS ---
 def _get_error_detail(resp):
@@ -318,7 +388,7 @@ async def check_api_key_permissions(api_key: str) -> dict:
                     results["album.create"]["message"] = "✅ OK"
                     test_album_id = None
                 else:
-                    results["album.create"]["message"] = f"✅ OK (альбом не удалён)"
+                    results["album.create"]["message"] = "✅ OK (альбом не удалён)"
             except:
                 results["album.create"]["message"] = "✅ OK"
         elif resp.status_code == 403:
@@ -366,8 +436,10 @@ async def check_api_key_permissions(api_key: str) -> dict:
             pass
         finally:
             if os.path.exists(test_file_path):
-                try: os.remove(test_file_path)
-                except: pass
+                try:
+                    os.remove(test_file_path)
+                except:
+                    pass
 
     # 5. asset.download
     if existing_asset_id:
@@ -484,8 +556,10 @@ async def check_api_key_permissions(api_key: str) -> dict:
                             results["asset.upload"]["message"] = "✅ OK (created)"
                             new_asset_id = res_json.get("id")
                             if new_asset_id:
-                                try: requests.delete(f"{IMMICH_URL}/api/assets", headers=headers, json={"ids": [new_asset_id]}, timeout=10)
-                                except: pass
+                                try:
+                                    requests.delete(f"{IMMICH_URL}/api/assets", headers=headers, json={"ids": [new_asset_id]}, timeout=10)
+                                except:
+                                    pass
                         else:
                             results["asset.upload"]["status"] = True
                             results["asset.upload"]["message"] = "✅ OK"
@@ -621,9 +695,12 @@ def release_lock(lock_path, instance_id):
 # --- UTILS ---
 def fix_perms(path):
     try:
-        if os.path.isdir(path): os.chmod(path, 0o777)
-        else: os.chmod(path, 0o666)
-    except: pass
+        if os.path.isdir(path):
+            os.chmod(path, 0o777)
+        else:
+            os.chmod(path, 0o666)
+    except:
+        pass
 
 def load_history():
     if not os.path.exists(HISTORY_FILE):
@@ -631,7 +708,8 @@ def load_history():
     try:
         with open(HISTORY_FILE, 'r', encoding='utf-8') as f:
             data = json.load(f)
-            if "last_chat_id" not in data: data["last_chat_id"] = None
+            if "last_chat_id" not in data:
+                data["last_chat_id"] = None
             return data
     except:
         return {"albums": [], "photographers": [], "last_chat_id": None}
@@ -643,19 +721,22 @@ def update_history(album, photographer, chat_id=None):
     data = load_history()
     changed = False
     if album:
-        if album in data["albums"]: data["albums"].remove(album)
+        if album in data["albums"]:
+            data["albums"].remove(album)
         data["albums"].insert(0, album)
         data["albums"] = data["albums"][:10]
         changed = True
     if photographer:
-        if photographer in data["photographers"]: data["photographers"].remove(photographer)
+        if photographer in data["photographers"]:
+            data["photographers"].remove(photographer)
         data["photographers"].insert(0, photographer)
         data["photographers"] = data["photographers"][:10]
         changed = True
     if chat_id:
         data["last_chat_id"] = chat_id
         changed = True
-    if changed: save_history(data)
+    if changed:
+        save_history(data)
 
 def get_or_create_album(requested_name, api_key):
     if not requested_name or len(str(requested_name).strip()) < 2:
@@ -692,16 +773,20 @@ def get_or_create_album(requested_name, api_key):
     return None
 
 def parse_tags(text):
-    if not text: return None, None
+    if not text:
+        return None, None
     album, fotografo = None, None
     alb_m = re.search(r"#album\s+([^#\n\/]+)", text, re.IGNORECASE)
-    if alb_m: album = re.sub(r"\.(zip|rar|7z|tar|gz|jpg|jpeg|png|heic|webp)$", "", alb_m.group(1).strip(), flags=re.IGNORECASE).strip()
+    if alb_m:
+        album = re.sub(r"\.(zip|rar|7z|tar|gz|jpg|jpeg|png|heic|webp)$", "", alb_m.group(1).strip(), flags=re.IGNORECASE).strip()
     foto_m = re.search(r"#fotografo\s+([^#\n\/]+)", text, re.IGNORECASE)
-    if foto_m: fotografo = re.sub(r"\.(zip|rar|7z|tar|gz|jpg|jpeg|png|heic|webp)$", "", foto_m.group(1).strip(), flags=re.IGNORECASE).strip()
+    if foto_m:
+        fotografo = re.sub(r"\.(zip|rar|7z|tar|gz|jpg|jpeg|png|heic|webp)$", "", foto_m.group(1).strip(), flags=re.IGNORECASE).strip()
     return album, fotografo
 
 def clean_caption(text):
-    if not text: return None
+    if not text:
+        return None
     cleaned = text
     cleaned = re.sub(r"#album\s+[^#\n\/]+", "", cleaned, flags=re.IGNORECASE)
     cleaned = re.sub(r"#fotografo\s+[^#\n\/]+", "", cleaned, flags=re.IGNORECASE)
@@ -715,12 +800,15 @@ def get_effective_tags(user_id, current_text):
         return ta, tf
     if user_id in USER_TAGS_MEM:
         memo = USER_TAGS_MEM[user_id]
-        if time.time() - memo["time"] < 1800: return memo["tags"]
+        if time.time() - memo["time"] < 1800:
+            return memo["tags"]
     return None, None
 
 def is_file_stable(filepath, wait_time=5):
-    if filepath.endswith(".part"): return False
-    if os.path.exists(filepath + ".part"): return False
+    if filepath.endswith(".part"):
+        return False
+    if os.path.exists(filepath + ".part"):
+        return False
     if wait_time <= 0:
         try:
             return os.path.getsize(filepath) > 0
@@ -739,7 +827,8 @@ def calculate_checksum(file_path):
     with open(file_path, 'rb') as f:
         while True:
             data = f.read(65536)
-            if not data: break
+            if not data:
+                break
             sha1.update(data)
     return sha1.hexdigest()
 
@@ -792,7 +881,8 @@ async def upload_file_path_to_immich(file_path, original_name, telegram_date, me
             chk = calculate_checksum(file_path)
             asset_id = await find_asset_by_checksum(chk, user_api_key)
 
-        if not asset_id: return status, None
+        if not asset_id:
+            return status, None
 
         description_parts = []
         if caption:
@@ -811,10 +901,12 @@ async def upload_file_path_to_immich(file_path, original_name, telegram_date, me
 
         target_ids = []
         aid = get_or_create_album(extra_album, user_api_key)
-        if aid: target_ids.append(aid)
+        if aid:
+            target_ids.append(aid)
         if fotografo:
             fid = get_or_create_album(fotografo, user_api_key)
-            if fid: target_ids.append(fid)
+            if fid:
+                target_ids.append(fid)
 
         for alb_id in list(set(target_ids)):
             try:
@@ -824,7 +916,8 @@ async def upload_file_path_to_immich(file_path, original_name, telegram_date, me
 
         return status, asset_id
     except Exception as e:
-        logging.error(f"Upload error: {e}"); return "error", None
+        logging.error(f"Upload error: {e}")
+        return "error", None
 
 # --- PROCESSORS ---
 async def process_directory_content(directory, msg_date, msg_id, user_config: dict, manual_tags=None, bot=None, chat_id=None, caption=None):
@@ -844,9 +937,11 @@ async def process_directory_content(directory, msg_date, msg_id, user_config: di
             for file in files:
                 if file.lower().endswith((".zip", ".rar", ".7z", ".tar", ".gz")):
                     full_p = os.path.join(root, file)
-                    if not is_file_stable(full_p, wait_time=3): continue
+                    if not is_file_stable(full_p, wait_time=3):
+                        continue
                     ext_to = os.path.join(root, "extracted_" + file)
-                    os.makedirs(ext_to, exist_ok=True); fix_perms(ext_to)
+                    os.makedirs(ext_to, exist_ok=True)
+                    fix_perms(ext_to)
                     try:
                         patoolib.extract_archive(full_p, outdir=ext_to)
                         os.remove(full_p)
@@ -859,17 +954,24 @@ async def process_directory_content(directory, msg_date, msg_id, user_config: di
     all_items = []
     for root, dirs, files in os.walk(directory):
         dirs[:] = [d for d in dirs if d not in ["corrupted", "failed_extraction", "unsupported_files"]]
-        for file in files: all_items.append((root, file))
+        for file in files:
+            all_items.append((root, file))
 
-    total_count = len(all_items); processed_count = 0; progress_msg = None
+    total_count = len(all_items)
+    processed_count = 0
+    progress_msg = None
     if total_count > 5 and bot and chat_id:
-        try: progress_msg = await bot.send_message(chat_id=chat_id, text=f"⏳ <b>Avanzamento:</b> 0/{total_count}...", parse_mode="HTML")
-        except: pass
+        try:
+            progress_msg = await bot.send_message(chat_id=chat_id, text=f"⏳ <b>Avanzamento:</b> 0/{total_count}...", parse_mode="HTML")
+        except:
+            pass
 
     for root, file in all_items:
-        processed_count += 1; full_p = os.path.join(root, file)
-        # Для распакованных файлов wait_time=0 (проверка мгновенная)
-        if not is_file_stable(full_p, wait_time=0): continue
+        processed_count += 1
+        full_p = os.path.join(root, file)
+        # Для распакованных файлов проверка мгновенная (без ожидания)
+        if not is_file_stable(full_p, wait_time=0):
+            continue
         if file.lower().endswith(('.jpg', '.jpeg', '.png', '.heic', '.mp4', '.mov', '.avi', '.webp',
                                    '.raf', '.cr2', '.cr3', '.nef', '.arw', '.dng', '.rw2', '.orf', '.raw')):
             final_alb = manual_tags[0] if manual_tags and manual_tags[0] else None
@@ -878,15 +980,21 @@ async def process_directory_content(directory, msg_date, msg_id, user_config: di
             rel_p = os.path.relpath(full_p, directory)
             p_alb, p_foto = parse_tags(rel_p)
 
-            if p_foto: logging.info(f"Found photographer in path: {p_foto}")
-            if p_alb and not final_alb: final_alb = p_alb
-            if p_foto and not final_foto: final_foto = p_foto
-            if final_alb: current_job_albums.add(final_alb)
+            if p_foto:
+                logging.info(f"Found photographer in path: {p_foto}")
+            if p_alb and not final_alb:
+                final_alb = p_alb
+            if p_foto and not final_foto:
+                final_foto = p_foto
+            if final_alb:
+                current_job_albums.add(final_alb)
 
             fb_date = msg_date
             if str(msg_id).startswith("watch"):
-                try: fb_date = datetime.fromtimestamp(os.path.getmtime(full_p))
-                except: pass
+                try:
+                    fb_date = datetime.fromtimestamp(os.path.getmtime(full_p))
+                except:
+                    pass
 
             status, _ = await upload_file_path_to_immich(
                 full_p, file, fb_date, f"{msg_id}-{file}",
@@ -897,34 +1005,50 @@ async def process_directory_content(directory, msg_date, msg_id, user_config: di
             )
 
             if status in ["success", "duplicate"]:
-                try: os.remove(full_p)
-                except: pass
-                if status == "success": total_stats["success"] += 1
-                else: total_stats["duplicate"] += 1
-            else: total_stats["error"] += 1
+                try:
+                    os.remove(full_p)
+                except:
+                    pass
+                if status == "success":
+                    total_stats["success"] += 1
+                else:
+                    total_stats["duplicate"] += 1
+            else:
+                total_stats["error"] += 1
 
             if progress_msg and processed_count % 5 == 0:
                 perc = int((processed_count / total_count) * 100)
-                try: await bot.edit_message_text(chat_id=chat_id, message_id=progress_msg.message_id, text=f"⏳ <b>Avanzamento:</b> {processed_count}/{total_count} ({perc}%)", parse_mode="HTML")
-                except: pass
+                try:
+                    await bot.edit_message_text(chat_id=chat_id, message_id=progress_msg.message_id, text=f"⏳ <b>Avanzamento:</b> {processed_count}/{total_count} ({perc}%)", parse_mode="HTML")
+                except:
+                    pass
             await asyncio.sleep(1)
         else:
-            if root == IMPORT_DIR and (file == "put_files_here.txt" or file == "bot_history.json" or file == "user_mapping.json"): continue
+            if root == IMPORT_DIR and (file == "put_files_here.txt" or file == "bot_history.json" or file == "user_mapping.json"):
+                continue
             unsupported_dir = os.path.join(IMPORT_DIR, "unsupported_files")
             os.makedirs(unsupported_dir, exist_ok=True)
-            try: shutil.move(full_p, os.path.join(unsupported_dir, file)); total_stats["unsupported"] += 1
-            except: pass
+            try:
+                shutil.move(full_p, os.path.join(unsupported_dir, file))
+                total_stats["unsupported"] += 1
+            except:
+                pass
 
     if progress_msg:
-        try: await bot.delete_message(chat_id=chat_id, message_id=progress_msg.message_id)
-        except: pass
+        try:
+            await bot.delete_message(chat_id=chat_id, message_id=progress_msg.message_id)
+        except:
+            pass
 
     for root, dirs, files in os.walk(directory, topdown=False):
         for name in dirs:
             d_path = os.path.join(root, name)
-            if name in ["corrupted", "failed_extraction", "unsupported_files", "tg-immich-bot"] or d_path == directory: continue
-            try: os.rmdir(d_path)
-            except: pass
+            if name in ["corrupted", "failed_extraction", "unsupported_files", "tg-immich-bot"] or d_path == directory:
+                continue
+            try:
+                os.rmdir(d_path)
+            except:
+                pass
 
     return total_stats, list(current_job_albums)
 
@@ -934,10 +1058,12 @@ async def watch_folder_task(app):
     while True:
         try:
             await asyncio.sleep(30)
-            if not os.path.exists(IMPORT_DIR): continue
+            if not os.path.exists(IMPORT_DIR):
+                continue
             items = os.listdir(IMPORT_DIR)
             relevant = [i for i in items if i not in special_dirs and i not in ["put_files_here.txt", "bot_history.json", "user_mapping.json"]]
-            if not relevant: continue
+            if not relevant:
+                continue
 
             has_valid_content = False
             for root, dirs, files in os.walk(IMPORT_DIR):
@@ -946,10 +1072,13 @@ async def watch_folder_task(app):
                     if file.lower().endswith((".jpg", ".jpeg", ".png", ".heic", ".mp4", ".mov", ".avi", ".zip", ".rar", ".7z", ".tar", ".webp",
                                               ".raf", ".cr2", ".cr3", ".nef", ".arw", ".dng", ".rw2", ".orf", ".raw", ".gz")):
                         if is_file_stable(os.path.join(root, file), wait_time=2):
-                            has_valid_content = True; break
-                if has_valid_content: break
+                            has_valid_content = True
+                            break
+                if has_valid_content:
+                    break
 
-            if not has_valid_content: continue
+            if not has_valid_content:
+                continue
 
             mapping = load_user_mapping()
             if not mapping:
@@ -967,8 +1096,10 @@ async def watch_folder_task(app):
             target_chat = hist.get("last_chat_id")
 
             if target_chat:
-                try: await app.bot.send_message(chat_id=target_chat, text=f"📂 <b>Importazione Automatica Iniziata!</b> (User: {default_user_config['email']})", parse_mode="HTML")
-                except: pass
+                try:
+                    await app.bot.send_message(chat_id=target_chat, text=f"📂 <b>Importazione Automatica Iniziata!</b> (User: {default_user_config['email']})", parse_mode="HTML")
+                except:
+                    pass
 
             stats, albums = await process_directory_content(
                 IMPORT_DIR, datetime.now(), "watchdog",
@@ -978,11 +1109,16 @@ async def watch_folder_task(app):
 
             if target_chat and (sum(stats.values()) > 0):
                 report = f"📂 <b>Importazione Completata!</b>\n✅ {stats['success']} Caricati\n♻️ {stats['duplicate']} Duplicati"
-                if albums: report += f"\n📂 <b>Album:</b> {', '.join(albums)}"
-                if stats['unsupported'] > 0: report += f"\n⚠️ {stats['unsupported']} Non supportati"
-                if stats['error'] > 0: report += f"\n❌ {stats['error']} Errori"
-                try: await app.bot.send_message(chat_id=target_chat, text=report, parse_mode="HTML")
-                except: pass
+                if albums:
+                    report += f"\n📂 <b>Album:</b> {', '.join(albums)}"
+                if stats['unsupported'] > 0:
+                    report += f"\n⚠️ {stats['unsupported']} Non supportati"
+                if stats['error'] > 0:
+                    report += f"\n❌ {stats['error']} Errori"
+                try:
+                    await app.bot.send_message(chat_id=target_chat, text=report, parse_mode="HTML")
+                except:
+                    pass
         except asyncio.CancelledError:
             logging.info("Watch folder task cancelled.")
             break
@@ -1099,7 +1235,7 @@ async def handle_status(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 if is_connected and is_authorized:
                     status_text += "✅ <b>Подключен и авторизован</b> (готов к загрузке файлов >20 МБ)\n"
                 elif is_connected and not is_authorized:
-                    status_text += "⚠️ <b>Подключен, но не авторизован</b> (проверьте файл сессии .session)\n"
+                    status_text += "⚠️ <b>Подключен, но не авторизован</b> (проверьте файл сессии)\n"
                 else:
                     status_text += "❌ <b>Не подключен</b>\n"
             except Exception as e:
@@ -1142,43 +1278,57 @@ async def get_tags_markup(user_id):
         for i, alb in enumerate(data["albums"][:6]):
             label = f"✅ {alb}" if curr[0] == alb else alb
             row.append(InlineKeyboardButton(label, callback_data=f"alb_{i}"))
-            if len(row) == 2: keyboard.append(row); row = []
-        if row: keyboard.append(row)
+            if len(row) == 2:
+                keyboard.append(row)
+                row = []
+        if row:
+            keyboard.append(row)
     if data.get("photographers"):
         keyboard.append([InlineKeyboardButton("👤 FOTOGRAFI:", callback_data="none")])
         row = []
         for i, foto in enumerate(data["photographers"][:4]):
             label = f"✅ {foto}" if curr[1] == foto else foto
             row.append(InlineKeyboardButton(label, callback_data=f"foto_{i}"))
-            if len(row) == 2: keyboard.append(row); row = []
-        if row: keyboard.append(row)
+            if len(row) == 2:
+                keyboard.append(row)
+                row = []
+        if row:
+            keyboard.append(row)
     keyboard.append([InlineKeyboardButton("🗑 Cancella Tag", callback_data="reset_tags")])
     return InlineKeyboardMarkup(keyboard)
 
 async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    query = update.callback_query; await query.answer()
+    query = update.callback_query
+    await query.answer()
     user_id = update.effective_user.id
     if not get_user_config(user_id):
         await query.answer("Аккаунт не настроен!", show_alert=True)
         return
 
-    data = query.data; hist = load_history()
+    data = query.data
+    hist = load_history()
     curr = USER_TAGS_MEM.get(user_id, {"tags": [None, None], "time": time.time()})
-    if data == "reset_tags": curr["tags"] = [None, None]
+    if data == "reset_tags":
+        curr["tags"] = [None, None]
     elif data.startswith("alb_"):
         idx = int(data.split("_")[1])
         if idx < len(hist["albums"]):
-            val = hist["albums"][idx]; curr["tags"][0] = None if curr["tags"][0] == val else val
+            val = hist["albums"][idx]
+            curr["tags"][0] = None if curr["tags"][0] == val else val
     elif data.startswith("foto_"):
         idx = int(data.split("_")[1])
         if idx < len(hist["photographers"]):
-            val = hist["photographers"][idx]; curr["tags"][1] = None if curr["tags"][1] == val else val
-    curr["time"] = time.time(); USER_TAGS_MEM[user_id] = curr
+            val = hist["photographers"][idx]
+            curr["tags"][1] = None if curr["tags"][1] == val else val
+    curr["time"] = time.time()
+    USER_TAGS_MEM[user_id] = curr
     msg_text = "🗂 <b>Gestione Tag</b>\nSeleziona album o fotografo dai tasti sotto."
     if curr["tags"][0] or curr["tags"][1]:
         msg_text += f"\n\n🔹 <b>Attivi:</b>\n📂 Album: {curr['tags'][0] or '--'}\n👤 Foto: {curr['tags'][1] or '--'}"
-    try: await query.edit_message_text(msg_text, reply_markup=await get_tags_markup(user_id), parse_mode="HTML")
-    except: pass
+    try:
+        await query.edit_message_text(msg_text, reply_markup=await get_tags_markup(user_id), parse_mode="HTML")
+    except:
+        pass
 
 async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
@@ -1187,13 +1337,17 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     text = update.message.text
-    if len(text) > 200: return
+    if len(text) > 200:
+        return
     ta, tf = parse_tags(text)
     if ta or tf:
         curr_mem = USER_TAGS_MEM.get(user_id, {"tags": [None, None], "time": time.time()})
-        if ta: curr_mem["tags"][0] = ta
-        if tf: curr_mem["tags"][1] = tf
-        curr_mem["time"] = time.time(); USER_TAGS_MEM[user_id] = curr_mem
+        if ta:
+            curr_mem["tags"][0] = ta
+        if tf:
+            curr_mem["tags"][1] = tf
+        curr_mem["time"] = time.time()
+        USER_TAGS_MEM[user_id] = curr_mem
         update_history(ta, tf, update.effective_chat.id)
         await update.message.reply_text(f"✅ Tag aggiornati!\n📂 {curr_mem['tags'][0]}\n👤 {curr_mem['tags'][1]}")
 
@@ -1208,13 +1362,15 @@ async def handle_any_media(update: Update, context: ContextTypes.DEFAULT_TYPE):
     msg = update.message
     tags = get_effective_tags(user_id, msg.caption or "")
     raw_caption = msg.caption or None
-    file_obj = None; fname = "file.jpg"
+    file_obj = None
+    fname = "file.jpg"
 
     if msg.document:
         fname = msg.document.file_name or "file"
         mime = msg.document.mime_type or ""
         file_size = msg.document.file_size or 0
         if "image" in mime or "video" in mime or fname.lower().endswith((".zip", ".rar", ".7z", ".tar", ".gz")):
+            # Большие файлы через Telethon
             if file_size > 20 * 1024 * 1024 and telethon_client:
                 job_dir = os.path.join(TEMP_DIR, f"zip_{msg.message_id}")
                 os.makedirs(job_dir, exist_ok=True)
@@ -1222,37 +1378,20 @@ async def handle_any_media(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 sm = await msg.reply_text("⏳ <b>Скачивание большого файла через Telethon...</b>", parse_mode="HTML")
                 try:
                     async with TELETHON_SEMAPHORE:
-                        if not telethon_client.is_connected():
-                            logging.warning("🔄 Telethon отключен — переподключаюсь")
-                            await telethon_client.connect()
-
-                        telethon_msg = await telethon_client.get_messages(msg.chat_id, ids=msg.message_id)
-                        if telethon_msg is None:
-                            raise Exception("Telethon не нашёл сообщение (нет доступа к чату?)")
+                        telethon_msg = await telethon_get_message_safe(msg.chat_id, msg.message_id)
                         if not telethon_msg.media:
-                            raise Exception("В сообщении нет медиа для Telethon")
+                            raise Exception("В сообщении нет медиа для скачивания")
+                        logging.info(f"⬇️ Скачиваю {fname} ({file_size / 1024 / 1024:.1f} МБ) → {dest_path}")
+                        await telethon_download_to_path(telethon_msg, dest_path)
 
-                        logging.info(f"⬇️ Скачиваю {fname} ({file_size/1024/1024:.1f} МБ) → {dest_path}")
-                        result = await telethon_client.download_media(telethon_msg, file=dest_path)
-                        logging.info(f"⬇️ download_media вернул: {result!r}")
-
-                        if not result:
-                            raise Exception("download_media вернул None — медиа не скачано")
-
-                        final_path = result if isinstance(result, str) else dest_path
-                        if final_path != dest_path and os.path.exists(final_path):
-                            shutil.move(final_path, dest_path)
-                            logging.info(f"📦 Перемещено: {final_path} → {dest_path}")
-
-                    # Проверка после выхода из семафора
                     if not os.path.exists(dest_path):
                         raise Exception(f"Файл не появился на диске: {dest_path}")
                     size = os.path.getsize(dest_path)
                     if size == 0:
                         raise Exception("Файл пустой (0 байт)")
-                    logging.info(f"✅ Скачано: {dest_path} ({size/1024/1024:.1f} МБ)")
+                    logging.info(f"✅ Скачано: {dest_path} ({size / 1024 / 1024:.1f} МБ)")
 
-                    # Если у файла нет расширения архива — добавляем .zip
+                    # Если нет расширения архива — добавляем .zip
                     if not fname.lower().endswith((".zip", ".rar", ".7z", ".tar", ".gz")):
                         new_path = dest_path + ".zip"
                         os.rename(dest_path, new_path)
@@ -1268,7 +1407,8 @@ async def handle_any_media(update: Update, context: ContextTypes.DEFAULT_TYPE):
                     )
                     shutil.rmtree(job_dir)
                     rep = f"📦 <b>Большой архив обработан!</b>\n✅ {stats['success']} Фото\n♻️ {stats['duplicate']} Дубликатов"
-                    if albums: rep += f"\n📂 <b>Альбомы:</b> {', '.join(albums)}"
+                    if albums:
+                        rep += f"\n📂 <b>Альбомы:</b> {', '.join(albums)}"
                     await context.bot.edit_message_text(chat_id=msg.chat_id, message_id=sm.message_id, text=rep, parse_mode="HTML")
                     return
                 except Exception as e:
@@ -1276,19 +1416,23 @@ async def handle_any_media(update: Update, context: ContextTypes.DEFAULT_TYPE):
                     await context.bot.edit_message_text(chat_id=msg.chat_id, message_id=sm.message_id, text=f"❌ Ошибка скачивания: {e}")
                     shutil.rmtree(job_dir, ignore_errors=True)
                     return
+            # Малые файлы через Bot API
             try:
                 file_obj = await msg.document.get_file()
             except TelegramError as e:
                 if "too big" in str(e).lower():
-                    await msg.reply_text(f"❌ Файл слишком большой ({file_size / (1024*1024):.1f} МБ). Настройте Telethon или используйте папку импорта.")
+                    await msg.reply_text(f"❌ Файл слишком большой ({file_size / (1024 * 1024):.1f} МБ). Настройте Telethon или используйте папку импорта.")
                     return
                 raise
     elif msg.photo:
-        file_obj = await msg.photo[-1].get_file(); fname = f"photo_{file_obj.file_unique_id}.jpg"
+        file_obj = await msg.photo[-1].get_file()
+        fname = f"photo_{file_obj.file_unique_id}.jpg"
     elif msg.video:
-        file_obj = await msg.video.get_file(); fname = msg.video.file_name or f"video_{file_obj.file_unique_id}.mp4"
+        file_obj = await msg.video.get_file()
+        fname = msg.video.file_name or f"video_{file_obj.file_unique_id}.mp4"
     elif msg.video_note:
         file_size = msg.video_note.file_size or 0
+        # Большие видеосообщения через Telethon
         if file_size > 20 * 1024 * 1024 and telethon_client:
             job_dir = os.path.join(TEMP_DIR, f"vnote_{msg.message_id}")
             os.makedirs(job_dir, exist_ok=True)
@@ -1297,17 +1441,10 @@ async def handle_any_media(update: Update, context: ContextTypes.DEFAULT_TYPE):
             sm = await msg.reply_text("⏳ <b>Скачивание большого видеосообщения через Telethon...</b>", parse_mode="HTML")
             try:
                 async with TELETHON_SEMAPHORE:
-                    if not telethon_client.is_connected():
-                        await telethon_client.connect()
-                    telethon_msg = await telethon_client.get_messages(msg.chat_id, ids=msg.message_id)
-                    if telethon_msg is None:
-                        raise Exception("Telethon не нашёл сообщение")
-                    result = await telethon_client.download_media(telethon_msg, file=dest_path)
-                    if not result:
-                        raise Exception("download_media вернул None")
-                    final_path = result if isinstance(result, str) else dest_path
-                    if final_path != dest_path and os.path.exists(final_path):
-                        shutil.move(final_path, dest_path)
+                    telethon_msg = await telethon_get_message_safe(msg.chat_id, msg.message_id)
+                    if not telethon_msg.media:
+                        raise Exception("В сообщении нет медиа для скачивания")
+                    await telethon_download_to_path(telethon_msg, dest_path)
 
                 if not os.path.exists(dest_path) or os.path.getsize(dest_path) == 0:
                     raise Exception("Файл не скачан или пустой")
@@ -1328,6 +1465,7 @@ async def handle_any_media(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 await context.bot.edit_message_text(chat_id=msg.chat_id, message_id=sm.message_id, text=f"❌ Ошибка скачивания: {e}")
                 shutil.rmtree(job_dir, ignore_errors=True)
                 return
+        # Малые видеосообщения через Bot API
         max_retries = 3
         for attempt in range(max_retries):
             try:
@@ -1346,7 +1484,8 @@ async def handle_any_media(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     if file_obj:
         if fname.lower().endswith((".zip", ".rar", ".7z", ".tar", ".gz")):
-            job_dir = os.path.join(TEMP_DIR, f"zip_{msg.message_id}"); os.makedirs(job_dir, exist_ok=True)
+            job_dir = os.path.join(TEMP_DIR, f"zip_{msg.message_id}")
+            os.makedirs(job_dir, exist_ok=True)
             sm = await msg.reply_text("⏳ <b>Archivio ricevuto...</b>", parse_mode="HTML")
             await file_obj.download_to_drive(os.path.join(job_dir, fname))
             stats, albums = await process_directory_content(
@@ -1357,21 +1496,25 @@ async def handle_any_media(update: Update, context: ContextTypes.DEFAULT_TYPE):
             )
             shutil.rmtree(job_dir)
             rep = f"📦 <b>Elaborato!</b>\n✅ {stats['success']} Foto\n♻️ {stats['duplicate']} Duplicati"
-            if albums: rep += f"\n📂 <b>Album:</b> {', '.join(albums)}"
+            if albums:
+                rep += f"\n📂 <b>Album:</b> {', '.join(albums)}"
             await context.bot.edit_message_text(chat_id=msg.chat_id, message_id=sm.message_id, text=rep, parse_mode="HTML")
         else:
-            tmp = os.path.join(TEMP_DIR, fname); await file_obj.download_to_drive(tmp)
+            tmp = os.path.join(TEMP_DIR, fname)
+            await file_obj.download_to_drive(tmp)
             status, _ = await upload_file_path_to_immich(
                 tmp, fname, msg.date, msg.message_id,
                 user_api_key=user_config["api_key"],
                 extra_album=tags[0] if tags and tags[0] else None,
-                fotografo=tags[1] if tags and len(tags)>1 else None,
+                fotografo=tags[1] if tags and len(tags) > 1 else None,
                 caption=raw_caption
             )
             os.remove(tmp)
             report = "✅ Caricata!" if status == "success" else "♻️ Duplicata (Tag Aggiornati)."
-            if tags and tags[0]: report += f"\n📂 Album: {tags[0]}"
-            if tags and len(tags)>1 and tags[1]: report += f"\n👤 Foto: {tags[1]}"
+            if tags and tags[0]:
+                report += f"\n📂 Album: {tags[0]}"
+            if tags and len(tags) > 1 and tags[1]:
+                report += f"\n👤 Foto: {tags[1]}"
             await msg.reply_text(report, parse_mode="HTML")
 
 async def handle_url(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -1382,10 +1525,13 @@ async def handle_url(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     update_history(None, None, update.effective_chat.id)
     url_m = re.search(r'(https?://\S+)', update.message.text)
-    if not url_m: return
-    url = url_m.group(1); tags = get_effective_tags(user_id, update.message.text)
+    if not url_m:
+        return
+    url = url_m.group(1)
+    tags = get_effective_tags(user_id, update.message.text)
 
-    job_dir = os.path.join(TEMP_DIR, f"job_{update.message.message_id}"); os.makedirs(job_dir, exist_ok=True)
+    job_dir = os.path.join(TEMP_DIR, f"job_{update.message.message_id}")
+    os.makedirs(job_dir, exist_ok=True)
     msg = await update.message.reply_text("⏳ <b>Скачивание...</b>", parse_mode="HTML")
     success = False
     try:
@@ -1433,9 +1579,11 @@ async def handle_url(update: Update, context: ContextTypes.DEFAULT_TYPE):
     )
     shutil.rmtree(job_dir)
     rep = f"✅ <b>Completato!</b>\n{stats['success']} Caricati\n{stats['duplicate']} Duplicati"
-    if albums: rep += f"\n📂 Album: {', '.join(albums)}"
+    if albums:
+        rep += f"\n📂 Album: {', '.join(albums)}"
     await context.bot.edit_message_text(chat_id=msg.chat_id, message_id=msg.message_id, text=rep, parse_mode="HTML")
 
+# --- ERROR HANDLER ---
 async def error_handler(update: object, context: ContextTypes.DEFAULT_TYPE) -> None:
     error = context.error
     if isinstance(error, TelegramError):
@@ -1443,6 +1591,7 @@ async def error_handler(update: object, context: ContextTypes.DEFAULT_TYPE) -> N
     else:
         logging.error("❌ Неожиданная ошибка в боте:", exc_info=error)
 
+# --- MAIN ---
 async def main():
     # Инициализируем Telethon в том же event loop, что и бот
     await init_telethon_client()
@@ -1496,7 +1645,13 @@ async def main():
         logging.info("🛑 Bot shutdown complete.")
 
 if __name__ == "__main__":
-    request = HTTPXRequest(connection_pool_size=8, read_timeout=30.0, write_timeout=30.0, connect_timeout=30.0, pool_timeout=30.0)
+    request = HTTPXRequest(
+        connection_pool_size=8,
+        read_timeout=30.0,
+        write_timeout=30.0,
+        connect_timeout=30.0,
+        pool_timeout=30.0
+    )
     app = ApplicationBuilder().token(TOKEN).request(request).build()
     app.add_error_handler(error_handler)
     app.add_handler(CommandHandler("setup", handle_setup))
@@ -1507,5 +1662,5 @@ if __name__ == "__main__":
     app.add_handler(MessageHandler(filters.Entity("url") | filters.Entity("text_link"), handle_url))
     app.add_handler(MessageHandler(filters.TEXT & (~filters.COMMAND), handle_text))
     app.add_handler(MessageHandler(filters.PHOTO | filters.VIDEO | filters.VIDEO_NOTE | filters.Document.ALL, handle_any_media))
-    print("Bot avviato (v58 - Concurrent Safety + Telethon Fix)...")
+    print("Bot avviato (v59 - Concurrent Safety + Telethon Session Copy + Safe Download)...")
     asyncio.run(main())
