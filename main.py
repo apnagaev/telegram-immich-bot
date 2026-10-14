@@ -266,6 +266,25 @@ def parse_tags(text):
     if foto_m: fotografo = re.sub(r"\.(zip|rar|7z|tar|gz|jpg|jpeg|png|heic|webp)$", "", foto_m.group(1).strip(), flags=re.IGNORECASE).strip()
     return album, fotografo
 
+def clean_caption(text):
+    """
+    Очищает caption от служебных тегов #album и #fotografo,
+    чтобы в описании Immich остался только пользовательский текст.
+    """
+    if not text:
+        return None
+    
+    cleaned = text
+    # Удаляем #album <значение> (до следующего # или конца строки)
+    cleaned = re.sub(r"#album\s+[^#\n\/]+", "", cleaned, flags=re.IGNORECASE)
+    # Удаляем #fotografo <значение>
+    cleaned = re.sub(r"#fotografo\s+[^#\n\/]+", "", cleaned, flags=re.IGNORECASE)
+    # Удаляем лишние пробелы и переносы строк
+    cleaned = re.sub(r"\n{3,}", "\n\n", cleaned)
+    cleaned = cleaned.strip()
+    
+    return cleaned if cleaned else None
+
 def get_effective_tags(user_id, current_text):
     ta, tf = parse_tags(current_text)
     if ta or tf:
@@ -332,9 +351,10 @@ async def find_asset_by_checksum(checksum, api_key):
     return None
 
 # --- UPLOAD ---
-async def upload_file_path_to_immich(file_path, original_name, telegram_date, message_id, user_api_key, override_date=None, extra_album=None, fotografo=None):
+async def upload_file_path_to_immich(file_path, original_name, telegram_date, message_id, user_api_key, override_date=None, extra_album=None, fotografo=None, caption=None):
     try:
         if fotografo: logging.info(f"Uploading {original_name} with Photographer: {fotografo}")
+        if caption: logging.info(f"Uploading {original_name} with Caption: {caption[:50]}...")
         
         real_date = override_date or telegram_date
         headers = {"x-api-key": user_api_key, "Accept": "application/json"}
@@ -370,10 +390,29 @@ async def upload_file_path_to_immich(file_path, original_name, telegram_date, me
         
         if not asset_id: return status, None
 
+        # --- Формируем итоговое описание ---
+        # Объединяем caption (очищенный от тегов) и информацию о фотографе
+        description_parts = []
+        
+        if caption:
+            cleaned_caption = clean_caption(caption)
+            if cleaned_caption:
+                description_parts.append(cleaned_caption)
+        
         if fotografo:
+            description_parts.append(f"Fotografo: {fotografo}")
+        
+        if description_parts:
+            final_description = "\n\n".join(description_parts)
             try:
-                requests.put(f"{IMMICH_URL}/api/assets/{asset_id}", headers=headers, json={"description": f"Fotografo: {fotografo}"}, timeout=10)
-            except Exception as e: logging.error(f"Desc upd error: {e}")
+                requests.put(
+                    f"{IMMICH_URL}/api/assets/{asset_id}", 
+                    headers=headers, 
+                    json={"description": final_description}, 
+                    timeout=10
+                )
+            except Exception as e: 
+                logging.error(f"Desc upd error: {e}")
 
         target_ids = []
         aid = get_or_create_album(extra_album, user_api_key)
@@ -394,7 +433,7 @@ async def upload_file_path_to_immich(file_path, original_name, telegram_date, me
         logging.error(f"Upload error: {e}"); return "error", None
 
 # --- PROCESSORS ---
-async def process_directory_content(directory, msg_date, msg_id, user_config: dict, manual_tags=None, bot=None, chat_id=None):
+async def process_directory_content(directory, msg_date, msg_id, user_config: dict, manual_tags=None, bot=None, chat_id=None, caption=None):
     if not user_config or not user_config.get("api_key"):
         logging.error("Попытка обработки без конфигурации пользователя!")
         return {"success": 0, "duplicate": 0, "error": 0, "unsupported": 0}, []
@@ -459,7 +498,9 @@ async def process_directory_content(directory, msg_date, msg_id, user_config: di
             status, _ = await upload_file_path_to_immich(
                 full_p, file, fb_date, f"{msg_id}-{file}", 
                 user_api_key=user_api_key, 
-                extra_album=final_alb, fotografo=final_foto
+                extra_album=final_alb, 
+                fotografo=final_foto,
+                caption=caption
             )
             
             if status in ["success", "duplicate"]:
@@ -708,7 +749,11 @@ async def handle_any_media(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     update_history(None, None, update.effective_chat.id)
-    msg = update.message; tags = get_effective_tags(user_id, msg.caption or "")
+    msg = update.message
+    tags = get_effective_tags(user_id, msg.caption or "")
+    # Получаем caption для сохранения в описании Immich
+    raw_caption = msg.caption or None
+    
     file_obj = None; fname = "file.jpg"
     
     if msg.document:
@@ -730,7 +775,8 @@ async def handle_any_media(update: Update, context: ContextTypes.DEFAULT_TYPE):
                     stats, albums = await process_directory_content(
                         job_dir, msg.date, msg.message_id, 
                         user_config=user_config, 
-                        manual_tags=tags, bot=context.bot, chat_id=msg.chat_id
+                        manual_tags=tags, bot=context.bot, chat_id=msg.chat_id,
+                        caption=raw_caption
                     )
                     shutil.rmtree(job_dir)
                     rep = f"📦 <b>Большой архив обработан!</b>\n✅ {stats['success']} Фото\n♻️ {stats['duplicate']} Дубликатов"
@@ -773,7 +819,8 @@ async def handle_any_media(update: Update, context: ContextTypes.DEFAULT_TYPE):
                     dest_path, fname, msg.date, msg.message_id,
                     user_api_key=user_config["api_key"],
                     extra_album=tags[0] if tags and tags[0] else None,
-                    fotografo=tags[1] if tags and len(tags) > 1 else None
+                    fotografo=tags[1] if tags and len(tags) > 1 else None,
+                    caption=raw_caption
                 )
                 shutil.rmtree(job_dir)
                 report = "✅ Видео загружено!" if status == "success" else "♻️ Дубликат (теги обновлены)."
@@ -809,7 +856,8 @@ async def handle_any_media(update: Update, context: ContextTypes.DEFAULT_TYPE):
             stats, albums = await process_directory_content(
                 job_dir, msg.date, msg.message_id, 
                 user_config=user_config, 
-                manual_tags=tags, bot=context.bot, chat_id=msg.chat_id
+                manual_tags=tags, bot=context.bot, chat_id=msg.chat_id,
+                caption=raw_caption
             )
             shutil.rmtree(job_dir)
             rep = f"📦 <b>Elaborato!</b>\n✅ {stats['success']} Foto\n♻️ {stats['duplicate']} Duplicati"
@@ -821,7 +869,8 @@ async def handle_any_media(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 tmp, fname, msg.date, msg.message_id, 
                 user_api_key=user_config["api_key"], 
                 extra_album=tags[0] if tags and tags[0] else None, 
-                fotografo=tags[1] if tags and len(tags)>1 else None
+                fotografo=tags[1] if tags and len(tags)>1 else None,
+                caption=raw_caption
             )
             os.remove(tmp)
             report = "✅ Caricata!" if status == "success" else "♻️ Duplicata (Tag Aggiornati)."
@@ -908,7 +957,7 @@ async def handle_url(update: Update, context: ContextTypes.DEFAULT_TYPE):
 # --- ГЛОБАЛЬНЫЙ ОБРАБОТЧИК ОШИБОК ---
 async def error_handler(update: object, context: ContextTypes.DEFAULT_TYPE) -> None:
     error = context.error
-    if isinstance(error, TelegramError): # Базовый класс для всех ошибок telegram
+    if isinstance(error, TelegramError):
         logging.warning(f"⚠️ Ошибка Telegram: {error}. Повторная попытка будет выполнена автоматически.")
     else:
         logging.error("❌ Неожиданная ошибка в боте:", exc_info=error)
@@ -991,5 +1040,5 @@ if __name__ == "__main__":
     app.add_handler(MessageHandler(filters.TEXT & (~filters.COMMAND), handle_text))
     app.add_handler(MessageHandler(filters.PHOTO | filters.VIDEO | filters.VIDEO_NOTE | filters.Document.ALL, handle_any_media))
     
-    print("Bot avviato (v46 - Open Access with Strict Setup)...")
+    print("Bot avviato (v47 - Caption to Description)...")
     asyncio.run(main())
