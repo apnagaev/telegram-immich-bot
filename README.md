@@ -1,135 +1,90 @@
-# telegram-immich-bot
+📸 Telegram Immich Bot
+Многофункциональный Telegram-бот для автоматической загрузки медиафайлов (фото, видео, архивы) из Telegram в ваш личный сервер Immich.
+Бот поддерживает многопользовательский режим без глобальных ключей: каждый пользователь привязывает свой собственный API-ключ Immich через команду /setup, и файлы загружаются строго в его личный аккаунт.
+✨ Основные возможности
+🔐 Многопользовательская архитектура: Нет глобального API-ключа в .env. Каждый пользователь настраивает бота под себя.
+📁 Поддержка архивов: Автоматическая распаковка .zip, .rar, .7z, .tar, .gz и загрузка содержимого.
+🚀 Загрузка больших файлов: Использование библиотеки Telethon для скачивания файлов размером более 20 МБ (ограничение стандартного Bot API).
+🔗 Загрузка по ссылкам: Поддержка прямых ссылок, YouTube, TikTok, Instagram (через yt-dlp), WeTransfer, а также интеграция с JDownloader.
+🏷️ Умные теги: Распознавание #album <имя> и #fotografo <имя> в подписи к файлу. Бот автоматически создаст альбомы и добавит фотографа в описание.
+🧹 Очистка описания: Служебные теги автоматически удаляются из текста, и в Immich сохраняется только чистый пользовательский текст.
+👀 Watch Folder (Автоимпорт): Мониторинг папки /import. Любые файлы, помещенные в эту папку, будут автоматически загружены в Immich.
+🔒 Active-Passive High Availability: Встроенный механизм блокировок (lock file) позволяет запускать несколько экземпляров бота без риска дублирования загрузок.
+⚙️ Требования
+Работающий сервер Immich.
+Токен Telegram-бота (получить у @BotFather).
+(Рекомендуется) API_ID и API_HASH от Telegram (получить на my.telegram.org) для загрузки файлов > 20 МБ.
+Docker и Docker Compose (рекомендуемый способ установки).
+🚀 Установка и запуск (Docker)
+Создайте директорию для бота и перейдите в неё:
+bash
 
-A Telegram bot that uploads photos, videos, and archives directly to your [Immich](https://immich.app/) instance. Supports album management, photographer tagging, JDownloader integration, URL downloads, and automatic folder watching.
+1
+Создайте файл docker-compose.yml:
+yaml
 
-## Features
+12345678910111213141516171819202122232425
+Создайте файл requirements.txt:
+text
 
-- **Upload from Telegram up to 2GB** — send photos, videos, or documents directly to your Immich library
-- **Archive extraction** — ZIP, RAR, 7z, TAR archives are automatically extracted before upload
-- **Album tagging** — use `#album <name>` in captions or messages to assign assets to a named album
-- **Photographer tagging** — use `#fotografo <name>` to tag the photographer; a dedicated album is created automatically
-- **Tag memory** — active tags are remembered for 30 minutes across multiple uploads
-- **URL download** — send a URL to download and import the file (supports `curl`, `wget`, `yt-dlp`)
-- **Watch folder** — files dropped in the import directory are automatically imported every 30 seconds
-- **Duplicate detection** — duplicate assets are detected via SHA-1 checksum and skipped gracefully
-- **Access control** — only whitelisted Telegram user IDs can interact with the bot
+123456
+Создайте необходимые папки:
+bash
 
-## Requirements
+1
+Запустите бота:
+bash
 
-- Docker (recommended) or Python 3.11+
-- A running [Immich](https://immich.app/) instance
-- A Telegram bot token (from [@BotFather](https://t.me/BotFather))
-- Telethon token (from [my.telegram.org](https://my.telegram.org/))
-
-## Quick Start with Docker
-clone repo
-```
-git clone https://github.com/apnagaev/telegram-immich-bot.git
-```
-build container
-```
-cd telegram-immich-bot
-docker build -t immichtelebot .
-```
-
-edit telethon_session.sh, change API_ID = 1111111 and API_HASH = "11111111111111111111111"  to you ID and HASH from https://my.telegram.org/
-run
-```
-bash ./telethon_session.sh
-```
-map created telegram_session.session to docker container
-
-```yaml
-# docker-compose.yml
-  telegram-immich:
-    image: immichtelebot:latest # need build
-    container_name: telegram-immich
-    restart: unless-stopped
-    environment:
-      - TELEGRAM_TOKEN=bot_father_token
-      - IMMICH_URL=immich_url
-      - IMMICH_API_KEY=immich_api_key
-      - ALLOWED_USER_IDS=telegram_user_id
-      - IMPORT_DIR=/import
-      - ALBUM_ID=optional_album_id
-      - TZ=Europe/Moscow
-      - TELEGRAM_API_ID=telethone_api_id
-      - TELEGRAM_API_HASH=telethone_api_hash
-    volumes:
-      - ./telegrammal:/import
-      - ./telegram_session.session:/app/telegram_session.session
-
-```
-
-```bash
-docker compose up -d
-```
-
-## Environment Variables
-
-| Variable | Required | Description |
-|---|---|---|
-| `TELEGRAM_TOKEN` | Yes | Telegram bot token from @BotFather |
-| `IMMICH_URL` | Yes | Base URL of your Immich instance (e.g. `http://192.168.1.10:2283`) |
-| `IMMICH_API_KEY` | Yes | Immich API key (Settings → API Keys) |
-| `ALBUM_ID` | No | Default album ID where all uploads are added |
-| `ALLOWED_USER_IDS` | Yes | Comma-separated list of Telegram user IDs allowed to use the bot |
-| `IMPORT_DIR` | No | Directory to watch for files (default: `/import`) |
-| `MYJD_USER` | No | MyJDownloader account email |
-| `MYJD_PASSWORD` | No | MyJDownloader account password |
-| `MYJD_DEVICE` | No | JDownloader device name (default: `jdownloader`) |
-| `TELEGRAM_API_ID` | No | telethone API ID |
-| `TELEGRAM_API_HASH` | No | telethone HASH ID |
-
-## Usage
-
-### Sending files
-
-Send any photo, video, or document to the bot. Archives (ZIP, RAR, 7z) are automatically extracted.
-
-### Tagging
-
-Add tags in the message caption or as a standalone text message:
-
-```
-#album Vacation 2024
-#fotografo John Doe
-```
-
-Tags remain active for 30 minutes. Use the `/tags` command to view or change active tags via inline buttons.
-
-### Sending URLs
-
-Send a URL to download and import the content:
-
-- **Direct links / WeTransfer** — downloaded with `curl`, `wget` or `transferwee`
-
-### Commands
-
-| Command | Description |
-|---|---|
-| `/start` | Show the tag management menu |
-| `/tags` | Show the tag management menu |
-
-## How It Works
-
-1. The bot receives a file or URL from an authorized Telegram user.
-2. Files are downloaded to a temporary directory.
-3. Archives are recursively extracted.
-4. Each supported file is uploaded to Immich via the REST API.
-5. Assets are added to the configured albums (default album, `#album` tag, `#fotografo` album).
-6. Duplicates are detected by SHA-1 checksum and skipped.
-7. The watch folder task runs every 30 seconds and imports any files found in `IMPORT_DIR`.
-
-## Supported File Types
-
-Photos: `jpg`, `jpeg`, `png`, `heic`, `webp`  
-Videos: `mp4`, `mov`, `avi`  
-RAW: `raf`, `cr2`, `cr3`, `nef`, `arw`, `dng`, `rw2`, `orf`, `raw`  
-Archives: `zip`, `rar`, `7z`, `tar`, `gz`
-
-## License
-it is fork https://github.com/lelus78/telegram-immich-bot 
-
-MIT
-
+1
+🔑 Настройка прав API-ключа в Immich (КРИТИЧЕСКИ ВАЖНО!)
+При создании API-ключа в Immich НЕ используйте разрешение "All". Это избыточно и может вызвать ошибки проверки.
+Вручную отметьте ровно эти 10 разрешений:
+Разрешение
+Зачем нужно боту
+user.read
+Получение email и имени пользователя для привязки аккаунта.
+asset
+Базовый доступ к ассетам.
+asset.read
+Проверка метаданных для выявления дубликатов.
+asset.download
+Скачивание оригинала файла для проверки контрольной суммы.
+asset.upload
+Загрузка новых фото и видео.
+asset.update
+Добавление описания (caption) и имени фотографа к файлу.
+album
+Базовый доступ к альбомам.
+album.read
+Поиск существующих альбомов по имени.
+album.create
+Создание нового альбома (например, "Telegram Upload"), если он не найден.
+albumAsset.create
+Добавление загруженного файла в указанный альбом.
+📱 Использование бота
+1. Первоначальная настройка (/setup)
+Отправьте боту команду /setup. Бот покажет список необходимых прав и инструкцию.
+Создайте API-ключ в Immich с указанными выше 10 правами.
+Отправьте боту команду: /setup ВАШ_API_КЛЮЧ
+Бот проверит ключ, убедится в наличии всех прав, сохранит привязку и подтвердит успешную настройку.
+2. Проверка статуса (/status)
+Команда /status покажет:
+Привязанный Email и Telegram ID.
+Замаскированный API-ключ.
+Детальный отчет о проверке всех 10 разрешений.
+3. Отправка файлов
+Просто отправьте боту фото, видео, документ или архив. Вы можете добавить подпись (caption) с тегами:
+Отличные кадры с отпуска! 🌴
+#album Отпуск 2024
+#fotografo Иван Иванов
+Что сделает бот:
+Загрузит файл в ваш аккаунт Immich.
+Создаст (или найдет) альбом "Отпуск 2024" и добавит туда файл.
+В описание файла в Immich запишет: Отличные кадры с отпуска! 🌴\n\nFotografo: Иван Иванов (теги будут аккуратно удалены из текста).
+4. Управление тегами (/tags)
+Вызывает интерактивное меню с кнопками для быстрого выбора недавно использованных альбомов и фотографов, чтобы не печатать теги вручную каждый раз.
+📂 Watch Folder (Автоимпорт)
+Бот постоянно (каждые 30 секунд) мониторит папку, указанную в переменной IMPORT_DIR (по умолчанию /import).
+Если вы поместите туда фото, видео или архив, бот автоматически обработает их.
+Файлы будут загружены в аккаунт первого пользователя, указанного в файле data/user_mapping.json.
+После успешной загрузки исходные файлы из папки /import удаляются.
