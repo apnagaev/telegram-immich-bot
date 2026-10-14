@@ -11,6 +11,7 @@ import myjdapi
 import json
 import hashlib
 import uuid
+import fcntl
 from datetime import datetime
 from collections import defaultdict
 from io import BytesIO
@@ -29,6 +30,7 @@ API_HASH = os.getenv("TELEGRAM_API_HASH", "")
 SESSION_NAME = "telegram_session"
 
 telethon_client = None
+TELETHON_SEMAPHORE = asyncio.Semaphore(3)  # Максимум 3 параллельные загрузки через Telethon
 
 async def init_telethon_client():
     """Инициализирует Telethon в том же event loop, что и бот."""
@@ -80,7 +82,7 @@ if os.path.exists(TEMP_DIR): shutil.rmtree(TEMP_DIR)
 os.makedirs(TEMP_DIR, exist_ok=True)
 
 USER_TAGS_MEM = {}
-ALBUM_CACHE = {}
+ALBUM_CACHE = {}  # Ключ: (api_key_hash, album_name_lower)
 
 # Финальный минимальный список разрешений (ровно 10)
 REQUIRED_PERMISSIONS = {
@@ -100,6 +102,25 @@ if not TOKEN:
     logging.error("Variabile d'ambiente TELEGRAM_TOKEN mancante!"); exit(1)
 
 # --- USER MAPPING FUNCTIONS ---
+def _atomic_json_write(filepath, data):
+    """Атомарная запись JSON с файловой блокировкой для предотвращения race conditions."""
+    temp_path = f"{filepath}.tmp.{os.getpid()}"
+    lock_path = f"{filepath}.lock"
+    try:
+        with open(lock_path, 'a+') as lock_file:
+            fcntl.flock(lock_file.fileno(), fcntl.LOCK_EX)
+            try:
+                with open(temp_path, 'w', encoding='utf-8') as tf:
+                    json.dump(data, tf, indent=2, ensure_ascii=False)
+                shutil.move(temp_path, filepath)
+            finally:
+                fcntl.flock(lock_file.fileno(), fcntl.LOCK_UN)
+    except Exception as e:
+        logging.error(f"Atomic write error for {filepath}: {e}")
+        if os.path.exists(temp_path):
+            try: os.remove(temp_path)
+            except: pass
+
 def load_user_mapping() -> dict:
     if not os.path.exists(USER_MAPPING_FILE):
         try:
@@ -117,11 +138,7 @@ def load_user_mapping() -> dict:
         return {}
 
 def save_user_mapping(mapping: dict):
-    try:
-        with open(USER_MAPPING_FILE, 'w', encoding='utf-8') as f:
-            json.dump(mapping, f, indent=2)
-    except Exception as e:
-        logging.error(f"❌ Ошибка сохранения {USER_MAPPING_FILE}: {e}")
+    _atomic_json_write(USER_MAPPING_FILE, mapping)
 
 def get_user_config(telegram_user_id: int) -> dict:
     mapping = load_user_mapping()
@@ -602,9 +619,7 @@ def load_history():
         return {"albums": [], "photographers": [], "last_chat_id": None}
 
 def save_history(data):
-    try:
-        with open(HISTORY_FILE, 'w', encoding='utf-8') as f: json.dump(data, f)
-    except Exception as e: logging.error(f"History save error: {e}")
+    _atomic_json_write(HISTORY_FILE, data)
 
 def update_history(album, photographer, chat_id=None):
     data = load_history()
@@ -625,10 +640,15 @@ def update_history(album, photographer, chat_id=None):
     if changed: save_history(data)
 
 def get_or_create_album(requested_name, api_key):
+    """Ищет альбом по имени. Если не находит или имя пустое, создает 'Telegram Upload'.
+    Кэш изолирован по api_key, чтобы разные пользователи не путали альбомы."""
     if not requested_name or len(str(requested_name).strip()) < 2:
         requested_name = "Telegram Upload"
     
-    cache_key = (str(requested_name).lower(), api_key[:8])
+    # Используем хэш полного api_key для изоляции кэша между пользователями
+    api_key_hash = hashlib.md5(api_key.encode()).hexdigest()[:12]
+    cache_key = (api_key_hash, str(requested_name).lower())
+    
     if cache_key in ALBUM_CACHE:
         return ALBUM_CACHE[cache_key]
 
@@ -642,7 +662,7 @@ def get_or_create_album(requested_name, api_key):
                     return album["id"]
         
         fallback_name = "Telegram Upload"
-        fallback_cache_key = (fallback_name.lower(), api_key[:8])
+        fallback_cache_key = (api_key_hash, fallback_name.lower())
         if fallback_cache_key in ALBUM_CACHE:
             return ALBUM_CACHE[fallback_cache_key]
 
@@ -1202,8 +1222,10 @@ async def handle_any_media(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 dest_path = os.path.join(job_dir, fname)
                 sm = await msg.reply_text("⏳ <b>Скачивание большого файла через Telethon...</b>", parse_mode="HTML")
                 try:
-                    telethon_msg = await telethon_client.get_messages(msg.chat_id, ids=msg.message_id)
-                    await telethon_client.download_media(telethon_msg, file=dest_path)
+                    # Используем семафор для ограничения параллельных загрузок
+                    async with TELETHON_SEMAPHORE:
+                        telethon_msg = await telethon_client.get_messages(msg.chat_id, ids=msg.message_id)
+                        await telethon_client.download_media(telethon_msg, file=dest_path)
                     stats, albums = await process_directory_content(job_dir, msg.date, msg.message_id, user_config=user_config, manual_tags=tags, bot=context.bot, chat_id=msg.chat_id, caption=raw_caption)
                     shutil.rmtree(job_dir)
                     rep = f"📦 <b>Большой архив обработан!</b>\n✅ {stats['success']} Фото\n♻️ {stats['duplicate']} Дубликатов"
@@ -1235,8 +1257,9 @@ async def handle_any_media(update: Update, context: ContextTypes.DEFAULT_TYPE):
             dest_path = os.path.join(job_dir, fname)
             sm = await msg.reply_text("⏳ <b>Скачивание большого видеосообщения через Telethon...</b>", parse_mode="HTML")
             try:
-                telethon_msg = await telethon_client.get_messages(msg.chat_id, ids=msg.message_id)
-                await telethon_client.download_media(telethon_msg, file=dest_path)
+                async with TELETHON_SEMAPHORE:
+                    telethon_msg = await telethon_client.get_messages(msg.chat_id, ids=msg.message_id)
+                    await telethon_client.download_media(telethon_msg, file=dest_path)
                 status, _ = await upload_file_path_to_immich(dest_path, fname, msg.date, msg.message_id, user_api_key=user_config["api_key"], extra_album=tags[0] if tags and tags[0] else None, fotografo=tags[1] if tags and len(tags) > 1 else None, caption=raw_caption)
                 shutil.rmtree(job_dir)
                 report = "✅ Видео загружено!" if status == "success" else "♻️ Дубликат (теги обновлены)."
@@ -1296,6 +1319,7 @@ async def handle_url(update: Update, context: ContextTypes.DEFAULT_TYPE):
     # --- РАСШИРЕННЫЙ СПИСОК ДОМЕНОВ ДЛЯ JDOWNLOADER ---
     JD_DOMAINS = [
         "drive.google.com", "docs.google.com", "googledrive.com",
+        "takeout-download-drive-eu.usercontent.google.com","usercontent.google.com",
         "mega.nz", "mega.co.nz",
         "dropbox.com", "dropboxusercontent.com",
         "1fichier.com", "filecrypt.cc",
@@ -1435,5 +1459,5 @@ if __name__ == "__main__":
     app.add_handler(MessageHandler(filters.Entity("url") | filters.Entity("text_link"), handle_url))
     app.add_handler(MessageHandler(filters.TEXT & (~filters.COMMAND), handle_text))
     app.add_handler(MessageHandler(filters.PHOTO | filters.VIDEO | filters.VIDEO_NOTE | filters.Document.ALL, handle_any_media))
-    print("Bot avviato (v56 - Fixed Telethon Event Loop Issue)...")
+    print("Bot avviato (v57 - Concurrent Safety & Telethon Fix)...")
     asyncio.run(main())
