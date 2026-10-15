@@ -116,9 +116,6 @@ bash ./telethon_session.sh
 | `TELEGRAM_API_ID` | ❌ | API ID для Telethon (нужен для загрузки файлов > 20 МБ). |
 | `TELEGRAM_API_HASH` | ❌ | API Hash для Telethon. |
 | `IMPORT_DIR` | ❌ | Путь к папке автоимпорта внутри контейнера (по умолчанию: `/import`). |
-| `MYJD_USER` | ❌ | Логин от JDownloader (для загрузки по ссылкам). |
-| `MYJD_PASSWORD` | ❌ | Пароль от JDownloader. |
-| `MYJD_DEVICE` | ❌ | Имя устройства JDownloader (по умолчанию: `jdownloader`). |
 | `LOCK_FILE_PATH` | ❌ | Путь к файлу блокировки для Active-Passive HA (по умолчанию: `/shared_storage/bot.lock`). |
 
 ---
