@@ -55,11 +55,6 @@ telethon_client = None
 TELETHON_SEMAPHORE = asyncio.Semaphore(3)  # Максимум 3 параллельные загрузки
 
 async def init_telethon_client():
-    """
-    Каждый экземпляр копирует сессию в /tmp с уникальным суффиксом,
-    чтобы контейнеры не дрались за одну базу SQLite.
-    Инициализация происходит в том же event loop, что и бот.
-    """
     global telethon_client
     if not (API_ID and API_HASH):
         logging.warning("⚠️ TELEGRAM_API_ID или TELEGRAM_API_HASH не заданы")
@@ -96,9 +91,8 @@ async def init_telethon_client():
 
 # --- GLOBALS ---
 USER_TAGS_MEM = {}
-ALBUM_CACHE = {}  # Ключ: (api_key_hash, album_name_lower)
+ALBUM_CACHE = {}
 
-# Финальный минимальный список разрешений (ровно 10)
 REQUIRED_PERMISSIONS = {
     "user.read": "Чтение профиля пользователя (email, имя)",
     "asset": "Базовый доступ к ассетам",
@@ -118,7 +112,6 @@ if not TOKEN:
 
 # --- ATOMIC JSON WRITE ---
 def _atomic_json_write(filepath, data):
-    """Атомарная запись JSON с файловой блокировкой для предотвращения race conditions."""
     temp_path = f"{filepath}.tmp.{os.getpid()}"
     lock_path = f"{filepath}.lock"
     try:
@@ -159,7 +152,6 @@ def save_user_mapping(mapping: dict):
     _atomic_json_write(USER_MAPPING_FILE, mapping)
 
 def get_user_config(telegram_user_id: int) -> dict:
-    """Ищет конфигурацию пользователя по Telegram ID. Возвращает None, если не найден."""
     mapping = load_user_mapping()
     for email, data in mapping.items():
         if str(data.get("telegram_user_id")) == str(telegram_user_id):
@@ -171,53 +163,89 @@ def get_user_config(telegram_user_id: int) -> dict:
     return None
 
 # --- TELETHON SAFE HELPERS ---
-async def telethon_get_message_safe(context, chat, message_id, retries=3, delay=2):
+async def telethon_get_message_safe(context, chat, message_id, file_size=None, file_name=None, retries=3, delay=2):
     """
     Надёжное получение сообщения через Telethon.
-    Для личных чатов использует chat.id (ID пользователя).
-    Для групп/каналов тоже использует chat.id.
+    1) Ищет диалог с ботом.
+    2) Пытается найти по ID (с принудительной синхронизацией кэша).
+    3) Если не находит — ищет по размеру и имени файла в последних 50 сообщениях диалога.
+    НИКАКОГО глобального перебора диалогов (это приводило к скачиванию чужих файлов с таким же ID).
     """
     if telethon_client is None:
         raise Exception("Telethon не инициализирован")
     if not telethon_client.is_connected():
-        logging.warning("🔄 Telethon отключен — переподключаюсь")
         await telethon_client.connect()
     if not await telethon_client.is_user_authorized():
-        raise Exception("Telethon не авторизован после переподключения")
+        raise Exception("Telethon не авторизован")
 
-    try:
-        me = await telethon_client.get_me()
-        logging.info(f"🔎 Telethon-сессия: id={me.id}, username={getattr(me, 'username', None)}")
-    except Exception as e:
-        logging.warning(f"Не удалось получить get_me(): {e}")
-
-    # Для всех типов чатов используем chat.id напрямую
-    # В личных чатах chat.id = ID пользователя
-    # В группах/каналах chat.id = ID группы/канала
-    target_entity = chat.id
-    logging.info(f"🔎 Ищу сообщение {message_id} в чате {target_entity} (type={chat.type})")
-
-    # Пробуем получить сообщение
-    for attempt in range(1, retries + 1):
+    target_entity = None
+    if chat.type == "private":
+        bot_id = context.bot.id
         try:
+            target_entity = await telethon_client.get_entity(bot_id)
+        except Exception:
+            async for dialog in telethon_client.iter_dialogs():
+                if dialog.id == bot_id:
+                    target_entity = dialog.entity
+                    break
+    else:
+        target_entity = chat.id
+
+    if target_entity is None:
+        raise Exception("Не удалось найти диалог с ботом")
+
+    # Попытка 1: по ID с принудительной синхронизацией
+    for attempt in range(retries):
+        try:
+            # Принудительно тянем последние сообщения, чтобы синхронизировать кэш сессии с сервером
+            await telethon_client.get_messages(target_entity, limit=10)
             msg = await telethon_client.get_messages(target_entity, ids=message_id)
-            if msg is not None and getattr(msg, "id", None) == message_id:
-                logging.info(f"✅ Найдено сообщение {message_id} (попытка {attempt})")
+            if msg is not None and msg.id == message_id and msg.media:
+                logging.info(f"✅ Найдено сообщение {message_id} по ID (попытка {attempt})")
                 return msg
         except Exception as e:
-            logging.warning(f"get_messages (попытка {attempt}): {e}")
-        
-        if attempt < retries:
-            logging.warning(f"⚠️ Сообщение {message_id} не найдено, попытка {attempt}/{retries}")
+            logging.warning(f"get_messages по ID (попытка {attempt}): {e}")
+        if attempt < retries - 1:
             await asyncio.sleep(delay)
 
+    # Попытка 2: поиск по размеру и имени файла (спасает при рассинхроне ID)
+    if file_size is not None and file_size > 0:
+        logging.info(f"🔎 Поиск по ID не удался. Ищу по размеру ({file_size} байт) и имени в последних 50 сообщениях диалога...")
+        try:
+            async for msg in telethon_client.iter_messages(target_entity, limit=50):
+                if not msg.media:
+                    continue
+                
+                # Document
+                if getattr(msg, 'document', None):
+                    if msg.document.size == file_size:
+                        doc_name = next((attr.file_name for attr in msg.document.attributes if hasattr(attr, 'file_name')), None)
+                        if file_name and doc_name and doc_name.lower() == file_name.lower():
+                            logging.info(f"✅ Найдено по размеру и имени: msg_id={msg.id}")
+                            return msg
+                        elif not file_name:
+                            logging.info(f"✅ Найдено по размеру: msg_id={msg.id}")
+                            return msg
+                
+                # Video
+                if getattr(msg, 'video', None) and msg.video.size == file_size:
+                    logging.info(f"✅ Найдено видео по размеру: msg_id={msg.id}")
+                    return msg
+                
+                # VideoNote
+                if getattr(msg, 'video_note', None) and msg.video_note.size == file_size:
+                    logging.info(f"✅ Найдено video_note по размеру: msg_id={msg.id}")
+                    return msg
+                    
+        except Exception as e:
+            logging.error(f"Ошибка при итерации сообщений: {e}")
+
     raise Exception(
-        f"Telethon не нашёл сообщение {message_id} в чате {chat.id} (type={chat.type}). "
-        f"Убедитесь, что файл .session принадлежит аккаунту {getattr(me, 'username', 'unknown')}."
+        f"Telethon не смог найти сообщение {message_id} в диалоге с ботом ни по ID, ни по размеру файла. "
+        f"Возможно, сессия ещё не синхронизировалась или файл был отправлен из другого аккаунта."
     )
 
 async def telethon_download_to_path(message, dest_path):
-    """Скачивает медиа из сообщения и возвращает реальный путь к файлу."""
     result = await telethon_client.download_media(message, file=dest_path)
     logging.info(f"⬇️ download_media вернул: {result!r}")
 
@@ -743,8 +771,6 @@ def update_history(album, photographer, chat_id=None):
         save_history(data)
 
 def get_or_create_album(requested_name, api_key):
-    """Ищет альбом по имени. Если не находит или имя пустое, создает 'Telegram Upload'.
-    Кэш изолирован по хэшу api_key, чтобы разные пользователи не путали альбомы."""
     if not requested_name or len(str(requested_name).strip()) < 2:
         requested_name = "Telegram Upload"
 
@@ -791,7 +817,6 @@ def parse_tags(text):
     return album, fotografo
 
 def clean_caption(text):
-    """Очищает caption от служебных тегов #album и #fotografo."""
     if not text:
         return None
     cleaned = text
@@ -976,7 +1001,6 @@ async def process_directory_content(directory, msg_date, msg_id, user_config: di
     for root, file in all_items:
         processed_count += 1
         full_p = os.path.join(root, file)
-        # Для распакованных файлов проверка мгновенная (без ожидания)
         if not is_file_stable(full_p, wait_time=0):
             continue
         if file.lower().endswith(('.jpg', '.jpeg', '.png', '.heic', '.mp4', '.mov', '.avi', '.webp',
@@ -1385,7 +1409,10 @@ async def handle_any_media(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 sm = await msg.reply_text("⏳ <b>Скачивание большого файла через Telethon...</b>", parse_mode="HTML")
                 try:
                     async with TELETHON_SEMAPHORE:
-                        telethon_msg = await telethon_get_message_safe(context, msg.chat, msg.message_id)
+                        telethon_msg = await telethon_get_message_safe(
+                            context, msg.chat, msg.message_id, 
+                            file_size=file_size, file_name=fname
+                        )
                         if not telethon_msg.media:
                             raise Exception("В сообщении нет медиа для скачивания")
                         logging.info(f"⬇️ Скачиваю {fname} ({file_size / 1024 / 1024:.1f} МБ) → {dest_path}")
@@ -1431,12 +1458,58 @@ async def handle_any_media(update: Update, context: ContextTypes.DEFAULT_TYPE):
                     await msg.reply_text(f"❌ Файл слишком большой ({file_size / (1024 * 1024):.1f} МБ). Настройте Telethon или используйте папку импорта.")
                     return
                 raise
+                
     elif msg.photo:
         file_obj = await msg.photo[-1].get_file()
         fname = f"photo_{file_obj.file_unique_id}.jpg"
+        
     elif msg.video:
-        file_obj = await msg.video.get_file()
-        fname = msg.video.file_name or f"video_{file_obj.file_unique_id}.mp4"
+        file_size = msg.video.file_size or 0
+        fname = msg.video.file_name or f"video_{msg.video.file_unique_id}.mp4"
+        # Большие видео через Telethon
+        if file_size > 20 * 1024 * 1024 and telethon_client:
+            job_dir = os.path.join(TEMP_DIR, f"video_{msg.message_id}")
+            os.makedirs(job_dir, exist_ok=True)
+            dest_path = os.path.join(job_dir, fname)
+            sm = await msg.reply_text("⏳ <b>Скачивание большого видео через Telethon...</b>", parse_mode="HTML")
+            try:
+                async with TELETHON_SEMAPHORE:
+                    telethon_msg = await telethon_get_message_safe(
+                        context, msg.chat, msg.message_id, 
+                        file_size=file_size, file_name=fname
+                    )
+                    if not telethon_msg.media:
+                        raise Exception("В сообщении нет медиа для скачивания")
+                    await telethon_download_to_path(telethon_msg, dest_path)
+
+                if not os.path.exists(dest_path) or os.path.getsize(dest_path) == 0:
+                    raise Exception("Файл не скачан или пустой")
+
+                status, _ = await upload_file_path_to_immich(
+                    dest_path, fname, msg.date, msg.message_id,
+                    user_api_key=user_config["api_key"],
+                    extra_album=tags[0] if tags and tags[0] else None,
+                    fotografo=tags[1] if tags and len(tags) > 1 else None,
+                    caption=raw_caption
+                )
+                shutil.rmtree(job_dir)
+                report = "✅ Видео загружено!" if status == "success" else "♻️ Дубликат (теги обновлены)."
+                await context.bot.edit_message_text(chat_id=msg.chat_id, message_id=sm.message_id, text=report, parse_mode="HTML")
+                return
+            except Exception as e:
+                logging.error(f"Telethon video download error: {e}", exc_info=True)
+                await context.bot.edit_message_text(chat_id=msg.chat_id, message_id=sm.message_id, text=f"❌ Ошибка скачивания: {e}")
+                shutil.rmtree(job_dir, ignore_errors=True)
+                return
+        # Малые видео через Bot API
+        try:
+            file_obj = await msg.video.get_file()
+        except TelegramError as e:
+            if "too big" in str(e).lower():
+                await msg.reply_text(f"❌ Видео слишком большое ({file_size / (1024 * 1024):.1f} МБ). Настройте Telethon.")
+                return
+            raise
+            
     elif msg.video_note:
         file_size = msg.video_note.file_size or 0
         # Большие видеосообщения через Telethon
@@ -1448,7 +1521,10 @@ async def handle_any_media(update: Update, context: ContextTypes.DEFAULT_TYPE):
             sm = await msg.reply_text("⏳ <b>Скачивание большого видеосообщения через Telethon...</b>", parse_mode="HTML")
             try:
                 async with TELETHON_SEMAPHORE:
-                    telethon_msg = await telethon_get_message_safe(context, msg.chat, msg.message_id)
+                    telethon_msg = await telethon_get_message_safe(
+                        context, msg.chat, msg.message_id, 
+                        file_size=file_size, file_name=fname
+                    )
                     if not telethon_msg.media:
                         raise Exception("В сообщении нет медиа для скачивания")
                     await telethon_download_to_path(telethon_msg, dest_path)
@@ -1669,5 +1745,5 @@ if __name__ == "__main__":
     app.add_handler(MessageHandler(filters.Entity("url") | filters.Entity("text_link"), handle_url))
     app.add_handler(MessageHandler(filters.TEXT & (~filters.COMMAND), handle_text))
     app.add_handler(MessageHandler(filters.PHOTO | filters.VIDEO | filters.VIDEO_NOTE | filters.Document.ALL, handle_any_media))
-    print("Bot avviato (v60 - Concurrent Safety + Telethon Session Copy + Safe Download)...")
+    print("Bot avviato (v61 - Fixed Telethon Dialog Sync + Fallback Size Match)...")
     asyncio.run(main())
