@@ -21,6 +21,7 @@ services:
       - MAX_CONCURRENT_JOBS_PER_USER=2
       - IO_MAX_WORKERS=16
       - CPU_MAX_WORKERS=4
+      - TEMP_DIR=/tmp/bot_downloads_${HOSTNAME}
     volumes:
       - /immich/telegrambot:/import
       - ./telegram_session.session:/app/telegram_session.session
