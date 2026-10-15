@@ -117,7 +117,14 @@ bash ./telethon_session.sh
 | `TELEGRAM_API_HASH` | ❌ | API Hash для Telethon. |
 | `IMPORT_DIR` | ❌ | Путь к папке автоимпорта внутри контейнера (по умолчанию: `/import`). |
 | `LOCK_FILE_PATH` | ❌ | Путь к файлу блокировки для Active-Passive HA (по умолчанию: `/shared_storage/bot.lock`). |
-
+| `MAX_CONCURRENT_TELETHON_DOWNLOADS` | ❌ | ↓ до 2 при слабом канале. |
+| `MAX_CONCURRENT_EXTRACTS` | ❌ | ↓ до 1 при медленном диске. |
+| `MAX_CONCURRENT_UPLOADS` | ❌ | 6 |
+| `MAX_CONCURRENT_UPLOADS_PER_JOB` | ❌ | 3 |
+| `MAX_CONCURRENT_JOBS_PER_USER` | ❌ | 2. |
+| `IO_MAX_WORKERS` | ❌ | 16 |
+| `CPU_MAX_WORKERS` | ❌ | 4 |
+| `TEMP_DIR` | ❌ | /tmp/bot_downloads_${HOSTNAME} |
 ---
 
 ## 🔧 Устранение неполадок
