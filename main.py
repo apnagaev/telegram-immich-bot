@@ -174,80 +174,93 @@ def get_user_config(telegram_user_id: int) -> dict:
 async def telethon_get_message_safe(context, chat, message_id, retries=3, delay=2):
     """
     Надёжное получение сообщения через Telethon.
-    1) Пробует быстрых кандидатов (ID бота для личных чатов, chat_id).
-    2) Если не найдено — перебирает все диалоги сессии.
-    Логирует личность сессии для диагностики несовпадения аккаунтов.
+    1) Для личных чатов ищет диалог с ботом через перебор (надёжнее, чем get_entity по кэшу).
+    2) Для групп/каналов использует chat.id.
+    3) Запасной перебор диалогов фильтрует сообщения без медиа.
     """
     if telethon_client is None:
         raise Exception("Telethon не инициализирован")
-
     if not telethon_client.is_connected():
         logging.warning("🔄 Telethon отключен — переподключаюсь")
         await telethon_client.connect()
-
     if not await telethon_client.is_user_authorized():
         raise Exception("Telethon не авторизован после переподключения")
 
-    # --- Диагностика: чья это сессия ---
     try:
         me = await telethon_client.get_me()
         logging.info(f"🔎 Telethon-сессия: id={me.id}, username={getattr(me, 'username', None)}")
     except Exception as e:
         logging.warning(f"Не удалось получить get_me(): {e}")
 
-    # --- Кандидаты-сущности ---
-    candidate_ids = []
-    if chat.type == "private":
-        try:
-            candidate_ids.append(context.bot.id)  # диалог пользователя с ботом
-        except Exception:
-            pass
-        candidate_ids.append(chat.id)
-    else:
-        candidate_ids.append(chat.id)
-    candidate_ids = list(dict.fromkeys(candidate_ids))
-    logging.info(f"🔎 Ищу сообщение {message_id}, кандидаты: {candidate_ids}")
+    # ── Определяем целевой диалог ──────────────────────────────────────
+    target_entity = None
 
-    # --- Попытка 1: быстрые кандидаты ---
-    for attempt in range(1, retries + 1):
-        for cid in candidate_ids:
+    if chat.type == "private":
+        bot_id = context.bot.id
+        logging.info(f"🔎 Личный чат: ищу диалог с ботом (id={bot_id})")
+
+        # Попытка 1: прямой get_entity (может не сработать, если кэш пуст)
+        try:
+            target_entity = await telethon_client.get_entity(bot_id)
+            logging.info(f"✅ Сущность бота получена напрямую: {target_entity}")
+        except Exception as e:
+            logging.warning(f"⚠️ get_entity({bot_id}) не удался: {e}")
+
+        # Попытка 2: находим диалог с ботом через перебор диалогов
+        if target_entity is None:
             try:
-                try:
-                    entity = await telethon_client.get_entity(cid)
-                except Exception:
-                    entity = cid  # если не резолвится — пробуем как есть
-                msg = await telethon_client.get_messages(entity, ids=message_id)
+                async for dialog in telethon_client.iter_dialogs():
+                    if dialog.id == bot_id:
+                        target_entity = dialog.entity
+                        logging.info(f"✅ Диалог с ботом найден: '{dialog.name}' (id={dialog.id})")
+                        break
+            except Exception as e:
+                logging.warning(f"Ошибка перебора диалогов при поиске бота: {e}")
+    else:
+        # Группа / канал — используем chat.id как есть
+        target_entity = chat.id
+
+    # ── Пробуем получить сообщение в целевом диалоге ───────────────────
+    if target_entity is not None:
+        for attempt in range(1, retries + 1):
+            try:
+                msg = await telethon_client.get_messages(target_entity, ids=message_id)
                 if msg is not None and getattr(msg, "id", None) == message_id:
-                    logging.info(f"✅ Найдено сообщение {message_id} (entity={cid}, попытка {attempt})")
+                    logging.info(f"✅ Найдено сообщение {message_id} в целевом диалоге (попытка {attempt})")
                     return msg
             except Exception as e:
-                logging.debug(f"get_messages(entity={cid}) ошибка: {e}")
-        if attempt < retries:
-            logging.warning(f"⚠️ Сообщение {message_id} не найдено, попытка {attempt}/{retries}")
-            await asyncio.sleep(delay)
+                logging.warning(f"get_messages в целевом диалоге (попытка {attempt}): {e}")
+            if attempt < retries:
+                logging.warning(f"⚠️ Сообщение {message_id} не найдено, попытка {attempt}/{retries}")
+                await asyncio.sleep(delay)
 
-    # --- Попытка 2: перебор всех диалогов (надёжный запасной путь) ---
-    logging.info("🔁 Быстрые кандидаты не сработали. Перебираю диалоги...")
+    # ── Запасной вариант: перебор диалогов с проверкой медиа ───────────
+    logging.info("🔁 Целевой диалог не сработал. Перебираю все диалоги...")
     checked = 0
     try:
         async for dialog in telethon_client.iter_dialogs():
             checked += 1
-            if checked > 100:  # разумный лимит
+            if checked > 100:
                 break
             try:
                 msg = await telethon_client.get_messages(dialog.entity, ids=message_id)
                 if msg is not None and getattr(msg, "id", None) == message_id:
-                    logging.info(f"✅ Найдено сообщение {message_id} в диалоге '{dialog.name}' (id={dialog.id})")
-                    return msg
+                    if msg.media:
+                        logging.info(f"✅ Найдено сообщение {message_id} в диалоге '{dialog.name}' (id={dialog.id})")
+                        return msg
+                    else:
+                        logging.warning(
+                            f"⚠️ Сообщение {message_id} найдено в '{dialog.name}' (id={dialog.id}), "
+                            f"но НЕ содержит медиа — пропускаю"
+                        )
             except Exception:
                 continue
     except Exception as e:
         logging.warning(f"Перебор диалогов завершился с ошибкой: {e}")
 
     raise Exception(
-        f"Telethon не нашёл сообщение {message_id} (чат {chat.id}, type={chat.type}). "
-        f"Проверьте в логах строку '🔎 Telethon-сессия': если её id != {chat.id}, "
-        f"значит файл .session принадлежит другому аккаунту — перегенерируйте его."
+        f"Telethon не нашёл сообщение {message_id} с медиа (чат {chat.id}, type={chat.type}). "
+        f"Убедитесь, что .session принадлежит тому же аккаунту, который отправляет файл боту."
     )
 
 async def telethon_download_to_path(message, dest_path):
